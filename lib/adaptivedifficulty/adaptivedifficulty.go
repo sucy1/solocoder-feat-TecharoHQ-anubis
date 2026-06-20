@@ -14,11 +14,13 @@ import (
 var ErrInvalidConfig = errors.New("adaptivedifficulty: invalid config")
 
 type Config struct {
-	MinDifficulty    int           `json:"min_difficulty" yaml:"min_difficulty"`
-	MaxDifficulty    int           `json:"max_difficulty" yaml:"max_difficulty"`
-	TargetCPULoad    float64       `json:"target_cpu_load" yaml:"target_cpu_load"`
-	TargetConnections int          `json:"target_connections" yaml:"target_connections"`
-	RecalcInterval   time.Duration `json:"recalc_interval" yaml:"recalc_interval"`
+	MinDifficulty     int           `json:"min_difficulty" yaml:"min_difficulty"`
+	MaxDifficulty     int           `json:"max_difficulty" yaml:"max_difficulty"`
+	TargetCPULoad     float64       `json:"target_cpu_load" yaml:"target_cpu_load"`
+	TargetConnections int           `json:"target_connections" yaml:"target_connections"`
+	RecalcInterval    time.Duration `json:"recalc_interval" yaml:"recalc_interval"`
+	MaxStep           int           `json:"max_step" yaml:"max_step"`
+	SmoothingFactor   float64       `json:"smoothing_factor" yaml:"smoothing_factor"`
 }
 
 func (c Config) Valid() error {
@@ -40,6 +42,15 @@ func (c Config) Valid() error {
 	}
 	if c.RecalcInterval <= 0 {
 		errs = append(errs, errors.New("RecalcInterval must be > 0"))
+	}
+	if c.MaxStep < 0 {
+		errs = append(errs, errors.New("MaxStep must be >= 0"))
+	}
+	if c.MaxStep > c.MaxDifficulty-c.MinDifficulty+1 && c.MaxStep != 0 {
+		errs = append(errs, errors.New("MaxStep too large for difficulty range"))
+	}
+	if c.SmoothingFactor < 0 || c.SmoothingFactor > 1 {
+		errs = append(errs, errors.New("SmoothingFactor must be between 0 and 1"))
 	}
 	if len(errs) > 0 {
 		return errors.Join(ErrInvalidConfig, errors.Join(errs...))
@@ -71,6 +82,23 @@ func New(cfg Config, lg *slog.Logger) *AdaptiveDifficulty {
 	}
 	if cfg.RecalcInterval <= 0 {
 		cfg.RecalcInterval = 60 * time.Second
+	}
+	if cfg.MaxStep <= 0 {
+		rangeSize := cfg.MaxDifficulty - cfg.MinDifficulty
+		if rangeSize < 1 {
+			rangeSize = 1
+		}
+		defaultStep := rangeSize / 10
+		if defaultStep < 1 {
+			defaultStep = 1
+		}
+		if defaultStep > 10 {
+			defaultStep = 10
+		}
+		cfg.MaxStep = defaultStep
+	}
+	if cfg.SmoothingFactor <= 0 {
+		cfg.SmoothingFactor = 0.3
 	}
 	return &AdaptiveDifficulty{
 		config:            cfg,
@@ -126,9 +154,30 @@ func (a *AdaptiveDifficulty) recalculate() {
 	connCount := atomic.LoadInt64(&a.connectionCount)
 	baseDiff := a.config.MinDifficulty
 
-	newDiff := baseDiff +
+	rawTarget := baseDiff +
 		int(float64(baseDiff)*(cpuLoad/a.config.TargetCPULoad)) +
 		int(float64(baseDiff)*(float64(connCount)/float64(a.config.TargetConnections)))
+
+	if rawTarget < a.config.MinDifficulty {
+		rawTarget = a.config.MinDifficulty
+	}
+	if rawTarget > a.config.MaxDifficulty {
+		rawTarget = a.config.MaxDifficulty
+	}
+
+	a.mu.Lock()
+	oldDiff := a.currentDifficulty
+	a.mu.Unlock()
+
+	smoothed := float64(oldDiff)*(1-a.config.SmoothingFactor) + float64(rawTarget)*a.config.SmoothingFactor
+	newDiff := int(smoothed + 0.5)
+
+	delta := newDiff - oldDiff
+	if delta > a.config.MaxStep {
+		newDiff = oldDiff + a.config.MaxStep
+	} else if delta < -a.config.MaxStep {
+		newDiff = oldDiff - a.config.MaxStep
+	}
 
 	if newDiff < a.config.MinDifficulty {
 		newDiff = a.config.MinDifficulty
@@ -137,14 +186,22 @@ func (a *AdaptiveDifficulty) recalculate() {
 		newDiff = a.config.MaxDifficulty
 	}
 
+	changed := false
 	a.mu.Lock()
-	oldDiff := a.currentDifficulty
-	if newDiff != oldDiff {
+	if newDiff != a.currentDifficulty {
 		a.currentDifficulty = newDiff
+		changed = true
 	}
 	a.mu.Unlock()
 
-	if newDiff != oldDiff {
-		a.lg.Info("adaptive difficulty recalculated", "old", oldDiff, "new", newDiff, "cpu_load", cpuLoad, "connections", connCount)
+	if changed {
+		a.lg.Info("adaptive difficulty recalculated",
+			"old", oldDiff,
+			"new", newDiff,
+			"raw_target", rawTarget,
+			"step_limit", a.config.MaxStep,
+			"smoothing", a.config.SmoothingFactor,
+			"cpu_load", cpuLoad,
+			"connections", connCount)
 	}
 }

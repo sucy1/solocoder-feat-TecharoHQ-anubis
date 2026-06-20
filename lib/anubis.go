@@ -818,6 +818,10 @@ func (s *Server) Start(ctx context.Context) {
 		s.adaptiveDifficulty.Start(ctx)
 		s.logger.Info("adaptive difficulty subsystem started")
 	}
+	if s.sessionCache != nil {
+		s.sessionCache.Start(ctx)
+		s.logger.Info("session cache HMAC key rotation started")
+	}
 }
 
 func (s *Server) ValidateSession(token string) (*sessioncache.Session, bool) {

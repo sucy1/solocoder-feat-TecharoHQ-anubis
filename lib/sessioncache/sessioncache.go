@@ -1,14 +1,16 @@
 package sessioncache
 
 import (
+	"container/list"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"container/list"
 	"sync"
 	"time"
 )
@@ -19,9 +21,10 @@ var (
 )
 
 type Config struct {
-	MaxEntries  int           `json:"maxEntries" yaml:"maxEntries"`
-	DefaultTTL  time.Duration `json:"defaultTTL" yaml:"defaultTTL"`
-	HMACKey     string        `json:"hmacKey" yaml:"hmacKey"`
+	MaxEntries       int           `json:"maxEntries" yaml:"maxEntries"`
+	DefaultTTL       time.Duration `json:"defaultTTL" yaml:"defaultTTL"`
+	HMACKey          string        `json:"hmacKey" yaml:"hmacKey"`
+	RotationInterval time.Duration `json:"rotation_interval" yaml:"rotation_interval"`
 }
 
 func (c Config) Valid() error {
@@ -34,7 +37,19 @@ func (c Config) Valid() error {
 	if c.HMACKey == "" {
 		return ErrMissingHMACKey
 	}
+	if c.RotationInterval < 0 {
+		return fmt.Errorf("%w: rotation_interval must be >= 0", ErrInvalidConfig)
+	}
 	return nil
+}
+
+type signedToken struct {
+	KeyID     int       `json:"kid"`
+	IP        string    `json:"ip"`
+	CreatedAt time.Time `json:"iat"`
+	ExpiresAt time.Time `json:"exp"`
+	Nonce     string    `json:"nonce"`
+	Sig       string    `json:"sig"`
 }
 
 type Session struct {
@@ -44,30 +59,136 @@ type Session struct {
 	ExpiresAt time.Time `json:"expiresAt"`
 }
 
+type keyEntry struct {
+	id     int
+	key    []byte
+	active time.Time
+}
+
 type Cache struct {
-	config  Config
-	mu      sync.Mutex
-	entries map[string]*list.Element
-	lru     *list.List
-	hmacKey []byte
-	lg      *slog.Logger
+	config     Config
+	mu         sync.Mutex
+	entries    map[string]*list.Element
+	lru        *list.List
+	hmacKeys   []keyEntry
+	nextKeyID  int
+	done       chan struct{}
+	lg         *slog.Logger
+}
+
+func deriveKey(seed string, kid int) []byte {
+	h := sha256.New()
+	h.Write([]byte(seed))
+	h.Write([]byte(fmt.Sprintf("|v%d", kid)))
+	sum := h.Sum(nil)
+	return sum
 }
 
 func New(cfg Config, lg *slog.Logger) (*Cache, error) {
 	if err := cfg.Valid(); err != nil {
 		return nil, err
 	}
+	if cfg.RotationInterval <= 0 {
+		cfg.RotationInterval = 24 * time.Hour
+	}
 
-	h := sha256.Sum256([]byte(cfg.HMACKey))
-	hmacKey := h[:]
+	initialKey := deriveKey(cfg.HMACKey, 0)
 
-	return &Cache{
+	cache := &Cache{
 		config:  cfg,
 		entries: make(map[string]*list.Element),
 		lru:     list.New(),
-		hmacKey: hmacKey,
-		lg:      lg,
-	}, nil
+		hmacKeys: []keyEntry{
+			{id: 0, key: initialKey, active: time.Now()},
+		},
+		nextKeyID: 1,
+		done:      make(chan struct{}),
+		lg:        lg,
+	}
+	return cache, nil
+}
+
+func (c *Cache) Start(ctx context.Context) {
+	if c.config.RotationInterval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(c.config.RotationInterval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-c.done:
+				return
+			case <-ticker.C:
+				c.Rotate()
+			}
+		}
+	}()
+}
+
+func (c *Cache) Stop() {
+	close(c.done)
+}
+
+func (c *Cache) Rotate() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	oldestMaxAge := 3 * c.config.RotationInterval
+	now := time.Now()
+	filtered := c.hmacKeys[:0]
+	for _, k := range c.hmacKeys {
+		if now.Sub(k.active) <= oldestMaxAge {
+			filtered = append(filtered, k)
+		}
+	}
+	c.hmacKeys = filtered
+
+	newKey := deriveKey(c.config.HMACKey, c.nextKeyID)
+	newEntry := keyEntry{
+		id:     c.nextKeyID,
+		key:    newKey,
+		active: now,
+	}
+	c.hmacKeys = append(c.hmacKeys, newEntry)
+	c.lg.Info("session cache: HMAC key rotated", "new_kid", c.nextKeyID, "total_keys", len(c.hmacKeys))
+	c.nextKeyID++
+	return newEntry.id
+}
+
+func (c *Cache) activeKey() (int, []byte) {
+	if len(c.hmacKeys) == 0 {
+		return -1, nil
+	}
+	best := c.hmacKeys[0]
+	for _, k := range c.hmacKeys[1:] {
+		if k.active.After(best.active) {
+			best = k
+		} else if k.active.Equal(best.active) && k.id > best.id {
+			best = k
+		}
+	}
+	return best.id, best.key
+}
+
+func (c *Cache) findKey(kid int) []byte {
+	for _, k := range c.hmacKeys {
+		if k.id == kid {
+			return k.key
+		}
+	}
+	return nil
+}
+
+func signToken(st *signedToken, key []byte) string {
+	stCopy := *st
+	stCopy.Sig = ""
+	payload, _ := json.Marshal(stCopy)
+	mac := hmac.New(sha256.New, key)
+	mac.Write(payload)
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (c *Cache) Create(ip string) Session {
@@ -75,20 +196,34 @@ func (c *Cache) Create(ip string) Session {
 	defer c.mu.Unlock()
 
 	now := time.Now()
-	randBytes := make([]byte, 16)
-	rand.Read(randBytes)
+	kid, key := c.activeKey()
+	if key == nil {
+		return Session{}
+	}
 
-	mac := hmac.New(sha256.New, c.hmacKey)
-	mac.Write([]byte(ip))
-	mac.Write([]byte(now.Format(time.RFC3339Nano)))
-	mac.Write(randBytes)
-	token := hex.EncodeToString(mac.Sum(nil))
+	nonceBytes := make([]byte, 16)
+	rand.Read(nonceBytes)
+	nonce := hex.EncodeToString(nonceBytes)
+
+	expires := now.Add(c.config.DefaultTTL)
+
+	st := signedToken{
+		KeyID:     kid,
+		IP:        ip,
+		CreatedAt: now,
+		ExpiresAt: expires,
+		Nonce:     nonce,
+	}
+	st.Sig = signToken(&st, key)
+
+	payloadBytes, _ := json.Marshal(st)
+	token := hex.EncodeToString(payloadBytes)
 
 	sess := Session{
 		Token:     token,
 		IP:        ip,
 		CreatedAt: now,
-		ExpiresAt: now.Add(c.config.DefaultTTL),
+		ExpiresAt: expires,
 	}
 
 	elem := c.lru.PushFront(sess)
@@ -107,8 +242,37 @@ func (c *Cache) Create(ip string) Session {
 }
 
 func (c *Cache) Validate(token string) (*Session, bool) {
+	var st signedToken
+	tokenBytes, err := hex.DecodeString(token)
+	if err != nil {
+		return nil, false
+	}
+	if err := json.Unmarshal(tokenBytes, &st); err != nil {
+		return nil, false
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	key := c.findKey(st.KeyID)
+	if key == nil {
+		return nil, false
+	}
+
+	expectedSig := signToken(&st, key)
+	if !hmac.Equal([]byte(expectedSig), []byte(st.Sig)) {
+		return nil, false
+	}
+
+	now := time.Now()
+	if now.After(st.ExpiresAt) {
+		elem, ok := c.entries[token]
+		if ok {
+			c.lru.Remove(elem)
+			delete(c.entries, token)
+		}
+		return nil, false
+	}
 
 	elem, ok := c.entries[token]
 	if !ok {
@@ -116,12 +280,6 @@ func (c *Cache) Validate(token string) (*Session, bool) {
 	}
 
 	sess := elem.Value.(Session)
-	if time.Now().After(sess.ExpiresAt) {
-		c.lru.Remove(elem)
-		delete(c.entries, token)
-		return nil, false
-	}
-
 	c.lru.MoveToFront(elem)
 	return &sess, true
 }

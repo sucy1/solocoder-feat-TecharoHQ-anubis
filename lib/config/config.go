@@ -351,6 +351,8 @@ type AdaptiveDifficultyConfig struct {
 	TargetCPULoad     float64       `json:"target_cpu_load,omitempty" yaml:"target_cpu_load,omitempty"`
 	TargetConnections int           `json:"target_connections,omitempty" yaml:"target_connections,omitempty"`
 	RecalcInterval    time.Duration `json:"recalc_interval,omitempty" yaml:"recalc_interval,omitempty"`
+	MaxStep           int           `json:"max_step,omitempty" yaml:"max_step,omitempty"`
+	SmoothingFactor   float64       `json:"smoothing_factor,omitempty" yaml:"smoothing_factor,omitempty"`
 	Enabled           bool          `json:"enabled" yaml:"enabled"`
 }
 
@@ -366,6 +368,12 @@ func (c AdaptiveDifficultyConfig) Valid() error {
 	}
 	if c.MinDifficulty > c.MaxDifficulty {
 		return fmt.Errorf("adaptive difficulty: min_difficulty > max_difficulty")
+	}
+	if c.MaxStep < 0 {
+		return fmt.Errorf("adaptive difficulty: max_step must be >= 0, got %d", c.MaxStep)
+	}
+	if c.SmoothingFactor < 0 || c.SmoothingFactor > 1 {
+		return fmt.Errorf("adaptive difficulty: smoothing_factor must be 0-1, got %f", c.SmoothingFactor)
 	}
 	return nil
 }
@@ -389,6 +397,22 @@ func (c IPFilterConfig) Valid() error {
 		default:
 			return fmt.Errorf("ip filter entry %d: invalid list_type %q", i, e.ListType)
 		}
+		containsSlash := false
+		for j := 0; j < len(e.CIDR); j++ {
+			if e.CIDR[j] == '/' {
+				containsSlash = true
+				break
+			}
+		}
+		if !containsSlash {
+			if ip := net.ParseIP(e.CIDR); ip == nil {
+				return fmt.Errorf("ip filter entry %d: invalid IP %q", i, e.CIDR)
+			}
+		} else {
+			if _, _, err := net.ParseCIDR(e.CIDR); err != nil {
+				return fmt.Errorf("ip filter entry %d: invalid CIDR %q: %w", i, e.CIDR, err)
+			}
+		}
 	}
 	return nil
 }
@@ -398,10 +422,11 @@ type EnhancedMetricsConfig struct {
 }
 
 type SessionCacheConfig struct {
-	MaxEntries int           `json:"maxEntries,omitempty" yaml:"maxEntries,omitempty"`
-	DefaultTTL time.Duration `json:"defaultTTL,omitempty" yaml:"defaultTTL,omitempty"`
-	HMACKey    string        `json:"hmacKey" yaml:"hmacKey"`
-	Enabled    bool          `json:"enabled" yaml:"enabled"`
+	MaxEntries       int           `json:"maxEntries,omitempty" yaml:"maxEntries,omitempty"`
+	DefaultTTL       time.Duration `json:"defaultTTL,omitempty" yaml:"defaultTTL,omitempty"`
+	HMACKey          string        `json:"hmacKey" yaml:"hmacKey"`
+	RotationInterval time.Duration `json:"rotation_interval,omitempty" yaml:"rotation_interval,omitempty"`
+	Enabled          bool          `json:"enabled" yaml:"enabled"`
 }
 
 func (c SessionCacheConfig) Valid() error {
@@ -416,6 +441,9 @@ func (c SessionCacheConfig) Valid() error {
 	}
 	if c.HMACKey == "" {
 		return fmt.Errorf("session cache: hmacKey is required when enabled")
+	}
+	if c.RotationInterval < 0 {
+		return fmt.Errorf("session cache: rotation_interval must be >= 0")
 	}
 	return nil
 }

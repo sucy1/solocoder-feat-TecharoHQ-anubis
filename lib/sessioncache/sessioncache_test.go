@@ -1,6 +1,8 @@
 package sessioncache
 
 import (
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"testing"
@@ -264,5 +266,124 @@ func TestSize(t *testing.T) {
 
 	if c.Size() != 5 {
 		t.Errorf("Size() = %d, want 5", c.Size())
+	}
+}
+
+func TestConfigValid_RotationInterval(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     Config
+		wantErr bool
+	}{
+		{
+			name: "rotation_interval zero defaults are OK at package-level",
+			cfg: Config{
+				MaxEntries: 100,
+				DefaultTTL: time.Minute,
+				HMACKey:    "secret",
+			},
+			wantErr: false,
+		},
+		{
+			name: "rotation_interval negative invalid",
+			cfg: Config{
+				MaxEntries:       100,
+				DefaultTTL:       time.Minute,
+				HMACKey:          "secret",
+				RotationInterval: -1 * time.Hour,
+			},
+			wantErr: true,
+		},
+		{
+			name: "rotation_interval positive valid",
+			cfg: Config{
+				MaxEntries:       100,
+				DefaultTTL:       time.Minute,
+				HMACKey:          "secret",
+				RotationInterval: 24 * time.Hour,
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Valid()
+			if tt.wantErr && err == nil {
+				t.Error("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expected no error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestNew_DefaultRotationInterval(t *testing.T) {
+	cfg := Config{
+		MaxEntries: 100,
+		DefaultTTL: time.Minute,
+		HMACKey:    "secret",
+	}
+	c, _ := New(cfg, slog.Default())
+	if c.config.RotationInterval <= 0 {
+		t.Errorf("expected RotationInterval default > 0, got %v", c.config.RotationInterval)
+	}
+}
+
+func TestRotate_KeyID(t *testing.T) {
+	cfg := Config{
+		MaxEntries:       100,
+		DefaultTTL:       time.Hour,
+		HMACKey:          "secret",
+		RotationInterval: 24 * time.Hour,
+	}
+	c, _ := New(cfg, slog.Default())
+
+	sess := c.Create("10.0.0.1")
+	if _, ok := c.Validate(sess.Token); !ok {
+		t.Fatal("pre-rotation token should validate")
+	}
+
+	newKid := c.Rotate()
+	if newKid < 0 {
+		t.Fatalf("Rotate returned invalid key id %d", newKid)
+	}
+
+	if _, ok := c.Validate(sess.Token); !ok {
+		t.Error("post-rotation old token should still validate via old key")
+	}
+
+	sess2 := c.Create("10.0.0.2")
+	if sess2.Token == sess.Token {
+		t.Error("new session after rotation must have different token")
+	}
+
+	var st2 signedToken
+	b2, _ := hex.DecodeString(sess2.Token)
+	json.Unmarshal(b2, &st2)
+	if st2.KeyID != newKid {
+		t.Errorf("new session signed with kid %d, want %d", st2.KeyID, newKid)
+	}
+}
+
+func TestValidate_TamperedSignature(t *testing.T) {
+	cfg := Config{
+		MaxEntries: 100,
+		DefaultTTL: time.Hour,
+		HMACKey:    "secret",
+	}
+	c, _ := New(cfg, slog.Default())
+
+	sess := c.Create("10.0.0.1")
+	raw, _ := hex.DecodeString(sess.Token)
+	var st signedToken
+	json.Unmarshal(raw, &st)
+
+	st.Sig = "0000000000000000000000000000000000000000000000000000000000000000"
+	forgedBytes, _ := json.Marshal(st)
+	forged := hex.EncodeToString(forgedBytes)
+
+	if _, ok := c.Validate(forged); ok {
+		t.Error("tampered signature should not validate")
 	}
 }

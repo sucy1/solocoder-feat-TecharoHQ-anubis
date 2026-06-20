@@ -64,6 +64,33 @@ func TestConfigValid(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "malformed CIDR fails in Valid()",
+			config: Config{
+				Entries: []Entry{
+					{CIDR: "192.168.1.0/99", ListType: ListTypeWhitelist},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "garbage IP string fails in Valid()",
+			config: Config{
+				Entries: []Entry{
+					{CIDR: "not-an-ip", ListType: ListTypeBlacklist},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "partial IPv4 like 300.x.x.x fails",
+			config: Config{
+				Entries: []Entry{
+					{CIDR: "300.1.2.3", ListType: ListTypeWhitelist},
+				},
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {

@@ -156,9 +156,11 @@ func New(opts Options) (*Server, error) {
 			TargetCPULoad:     ad.TargetCPULoad,
 			TargetConnections: ad.TargetConnections,
 			RecalcInterval:    ad.RecalcInterval,
+			MaxStep:           ad.MaxStep,
+			SmoothingFactor:   ad.SmoothingFactor,
 		}
 		result.adaptiveDifficulty = adaptivedifficulty.New(cfg, opts.Logger)
-		opts.Logger.Info("adaptive difficulty configured", "min", cfg.MinDifficulty, "max", cfg.MaxDifficulty)
+		opts.Logger.Info("adaptive difficulty configured", "min", cfg.MinDifficulty, "max", cfg.MaxDifficulty, "max_step", cfg.MaxStep, "smoothing", cfg.SmoothingFactor)
 	}
 
 	if ipf := opts.Policy.IPFilter; ipf != nil && len(ipf.Entries) > 0 {
@@ -187,15 +189,16 @@ func New(opts Options) (*Server, error) {
 
 	if sc := opts.Policy.SessionCache; sc != nil && sc.Enabled {
 		cache, err := sessioncache.New(sessioncache.Config{
-			MaxEntries: sc.MaxEntries,
-			DefaultTTL: sc.DefaultTTL,
-			HMACKey:    sc.HMACKey,
+			MaxEntries:       sc.MaxEntries,
+			DefaultTTL:       sc.DefaultTTL,
+			HMACKey:          sc.HMACKey,
+			RotationInterval: sc.RotationInterval,
 		}, opts.Logger)
 		if err != nil {
 			return nil, fmt.Errorf("lib: can't initialize session cache: %w", err)
 		}
 		result.sessionCache = cache
-		opts.Logger.Info("session cache configured", "max_entries", sc.MaxEntries, "default_ttl", sc.DefaultTTL)
+		opts.Logger.Info("session cache configured", "max_entries", sc.MaxEntries, "default_ttl", sc.DefaultTTL, "rotation_interval", sc.RotationInterval)
 	}
 
 	mux := http.NewServeMux()
