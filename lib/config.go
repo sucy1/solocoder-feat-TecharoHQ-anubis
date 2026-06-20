@@ -18,10 +18,15 @@ import (
 	"github.com/TecharoHQ/anubis/internal"
 	"github.com/TecharoHQ/anubis/internal/honeypot/naive"
 	"github.com/TecharoHQ/anubis/internal/ogtags"
+	"github.com/TecharoHQ/anubis/lib/adaptivedifficulty"
 	"github.com/TecharoHQ/anubis/lib/challenge"
 	"github.com/TecharoHQ/anubis/lib/config"
+	"github.com/TecharoHQ/anubis/lib/enhancedmetrics"
+	"github.com/TecharoHQ/anubis/lib/ipfilter"
 	"github.com/TecharoHQ/anubis/lib/localization"
 	"github.com/TecharoHQ/anubis/lib/policy"
+	"github.com/TecharoHQ/anubis/lib/sessioncache"
+	"github.com/TecharoHQ/anubis/lib/validationchain"
 	"github.com/TecharoHQ/anubis/web"
 	"github.com/TecharoHQ/anubis/xess"
 	"github.com/a-h/templ"
@@ -131,6 +136,68 @@ func New(opts Options) (*Server, error) {
 		logger: opts.Logger,
 	}
 
+	if vc := opts.Policy.ValidationChain; vc != nil && len(vc.Steps) > 0 {
+		steps := make([]validationchain.Step, len(vc.Steps))
+		for i, s := range vc.Steps {
+			steps[i] = validationchain.Step{
+				Type:    validationchain.StepType(s.Type),
+				Config:  s.Config,
+				Enabled: s.Enabled,
+			}
+		}
+		result.validationChain = validationchain.NewChain(steps)
+		opts.Logger.Info("validation chain configured", "steps", len(steps))
+	}
+
+	if ad := opts.Policy.AdaptiveDifficulty; ad != nil && ad.Enabled {
+		cfg := adaptivedifficulty.Config{
+			MinDifficulty:     ad.MinDifficulty,
+			MaxDifficulty:     ad.MaxDifficulty,
+			TargetCPULoad:     ad.TargetCPULoad,
+			TargetConnections: ad.TargetConnections,
+			RecalcInterval:    ad.RecalcInterval,
+		}
+		result.adaptiveDifficulty = adaptivedifficulty.New(cfg, opts.Logger)
+		opts.Logger.Info("adaptive difficulty configured", "min", cfg.MinDifficulty, "max", cfg.MaxDifficulty)
+	}
+
+	if ipf := opts.Policy.IPFilter; ipf != nil && len(ipf.Entries) > 0 {
+		entries := make([]ipfilter.Entry, len(ipf.Entries))
+		for i, e := range ipf.Entries {
+			entries[i] = ipfilter.Entry{
+				CIDR:     e.CIDR,
+				ListType: ipfilter.ListType(e.ListType),
+			}
+		}
+		filter, err := ipfilter.New(ipfilter.Config{Entries: entries}, opts.Logger)
+		if err != nil {
+			return nil, fmt.Errorf("lib: can't initialize IP filter: %w", err)
+		}
+		result.ipFilter = filter
+		opts.Logger.Info("IP filter configured", "entries", len(entries))
+	}
+
+	var metricsCfg *enhancedmetrics.MetricsConfig
+	if em := opts.Policy.EnhancedMetrics; em != nil {
+		metricsCfg = &enhancedmetrics.MetricsConfig{
+			MetricsToken: &enhancedmetrics.MetricsTokenConfig{Token: em.MetricsToken},
+		}
+	}
+	result.metricsCollector = enhancedmetrics.NewCollector(metricsCfg, opts.Logger)
+
+	if sc := opts.Policy.SessionCache; sc != nil && sc.Enabled {
+		cache, err := sessioncache.New(sessioncache.Config{
+			MaxEntries: sc.MaxEntries,
+			DefaultTTL: sc.DefaultTTL,
+			HMACKey:    sc.HMACKey,
+		}, opts.Logger)
+		if err != nil {
+			return nil, fmt.Errorf("lib: can't initialize session cache: %w", err)
+		}
+		result.sessionCache = cache
+		opts.Logger.Info("session cache configured", "max_entries", sc.MaxEntries, "default_ttl", sc.DefaultTTL)
+	}
+
 	mux := http.NewServeMux()
 	xess.Mount(mux)
 
@@ -176,6 +243,10 @@ func New(opts Options) (*Server, error) {
 	registerWithPrefix(anubis.APIPrefix+"pass-challenge", http.HandlerFunc(result.PassChallenge), "GET")
 	registerWithPrefix(anubis.APIPrefix+"check", http.HandlerFunc(result.maybeReverseProxyHttpStatusOnly), "")
 	registerWithPrefix("/", http.HandlerFunc(result.maybeReverseProxyOrPage), "")
+
+	if result.ipFilter != nil {
+		registerWithPrefix(anubis.APIPrefix+"ip-filter/", result.ipFilter.HTTPHandler(), "")
+	}
 
 	mazeGen, err := naive.New(result.store, result.logger)
 	if err == nil {

@@ -35,22 +35,27 @@ var (
 )
 
 type ParsedConfig struct {
-	Store             store.Interface
-	orig              *config.Config
-	Impressum         *config.Impressum
-	OpenGraph         config.OpenGraph
-	Bots              []Bot
-	Thresholds        []*Threshold
-	StatusCodes       config.StatusCodes
-	DefaultDifficulty int
-	DNSBL             bool
-	DnsCache          *dns.DnsCache
-	Dns               *dns.Dns
-	Logger            *slog.Logger
-	Metrics           *config.Metrics
-	ThothClient       *thoth.Client
-	LogASN            bool
-	NeedJA4H          bool
+	Store              store.Interface
+	orig               *config.Config
+	Impressum          *config.Impressum
+	OpenGraph          config.OpenGraph
+	Bots               []Bot
+	Thresholds         []*Threshold
+	StatusCodes        config.StatusCodes
+	DefaultDifficulty  int
+	DNSBL              bool
+	DnsCache           *dns.DnsCache
+	Dns                *dns.Dns
+	Logger             *slog.Logger
+	Metrics            *config.Metrics
+	ThothClient        *thoth.Client
+	LogASN             bool
+	NeedJA4H           bool
+	ValidationChain    *config.ValidationChainConfig
+	AdaptiveDifficulty *config.AdaptiveDifficultyConfig
+	IPFilter           *config.IPFilterConfig
+	EnhancedMetrics    *config.EnhancedMetricsConfig
+	SessionCache       *config.SessionCacheConfig
 }
 
 func newParsedConfig(orig *config.Config) *ParsedConfig {
@@ -259,6 +264,11 @@ func ParseConfig(ctx context.Context, fin io.Reader, fname string, defaultDiffic
 
 	result.DNSBL = c.DNSBL
 	result.NeedJA4H = configReferencesJA4H(c.Bots)
+	result.ValidationChain = c.ValidationChain
+	result.AdaptiveDifficulty = c.AdaptiveDifficulty
+	result.IPFilter = c.IPFilter
+	result.EnhancedMetrics = c.EnhancedMetrics
+	result.SessionCache = c.SessionCache
 
 	return result, nil
 }

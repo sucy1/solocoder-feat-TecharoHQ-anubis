@@ -430,6 +430,8 @@ func main() {
 		log.Fatalf("can't construct libanubis.Server: %v", err)
 	}
 
+	s.Start(ctx)
+
 	var h http.Handler
 	h = s
 	h = internal.CustomRealIPHeader(*customRealIPHeader, h)

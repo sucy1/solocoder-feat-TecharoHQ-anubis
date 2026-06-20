@@ -28,12 +28,17 @@ import (
 	"github.com/TecharoHQ/anubis/internal"
 	"github.com/TecharoHQ/anubis/internal/dnsbl"
 	"github.com/TecharoHQ/anubis/internal/ogtags"
+	"github.com/TecharoHQ/anubis/lib/adaptivedifficulty"
 	"github.com/TecharoHQ/anubis/lib/challenge"
 	"github.com/TecharoHQ/anubis/lib/config"
+	"github.com/TecharoHQ/anubis/lib/enhancedmetrics"
+	"github.com/TecharoHQ/anubis/lib/ipfilter"
 	"github.com/TecharoHQ/anubis/lib/localization"
 	"github.com/TecharoHQ/anubis/lib/policy"
 	"github.com/TecharoHQ/anubis/lib/policy/checker"
+	"github.com/TecharoHQ/anubis/lib/sessioncache"
 	"github.com/TecharoHQ/anubis/lib/store"
+	"github.com/TecharoHQ/anubis/lib/validationchain"
 	iptoasnv1 "github.com/TecharoHQ/thoth-proto/gen/techaro/thoth/iptoasn/v1"
 
 	// challenge implementations
@@ -91,15 +96,20 @@ var (
 )
 
 type Server struct {
-	next        http.Handler
-	store       store.Interface
-	mux         *http.ServeMux
-	policy      *policy.ParsedConfig
-	OGTags      *ogtags.OGTagCache
-	logger      *slog.Logger
-	opts        Options
-	ed25519Priv ed25519.PrivateKey
-	hs512Secret []byte
+	next                http.Handler
+	store               store.Interface
+	mux                 *http.ServeMux
+	policy              *policy.ParsedConfig
+	OGTags              *ogtags.OGTagCache
+	logger              *slog.Logger
+	opts                Options
+	ed25519Priv         ed25519.PrivateKey
+	hs512Secret         []byte
+	validationChain     *validationchain.Chain
+	adaptiveDifficulty  *adaptivedifficulty.AdaptiveDifficulty
+	ipFilter            *ipfilter.IPFilter
+	metricsCollector    *enhancedmetrics.Collector
+	sessionCache        *sessioncache.Cache
 }
 
 func (s *Server) getRequestLogger(r *http.Request) (*slog.Logger, *http.Request) {
@@ -156,6 +166,13 @@ func (s *Server) issueChallenge(ctx context.Context, r *http.Request, lg *slog.L
 		rule.Challenge = &config.ChallengeRules{
 			Difficulty: s.policy.DefaultDifficulty,
 			Algorithm:  config.DefaultAlgorithm,
+		}
+	}
+
+	if s.adaptiveDifficulty != nil {
+		rule.Challenge.Difficulty = s.adaptiveDifficulty.CurrentDifficulty()
+		if s.metricsCollector != nil {
+			s.metricsCollector.SetAdaptiveDifficulty(rule.Challenge.Difficulty)
 		}
 	}
 
@@ -242,6 +259,11 @@ func (s *Server) maybeReverseProxyOrPage(w http.ResponseWriter, r *http.Request)
 func (s *Server) maybeReverseProxy(w http.ResponseWriter, r *http.Request, httpStatusOnly bool) {
 	lg, r := s.getRequestLogger(r)
 
+	if s.metricsCollector != nil {
+		s.metricsCollector.IncQueue()
+		defer s.metricsCollector.DecQueue()
+	}
+
 	if s.opts.OpenGraph.Enabled {
 		if val, _ := s.store.Get(r.Context(), "ogtags:allow:"+r.Host+r.URL.String()); val != nil {
 			lg.Debug("serving opengraph tag asset")
@@ -250,10 +272,34 @@ func (s *Server) maybeReverseProxy(w http.ResponseWriter, r *http.Request, httpS
 		}
 	}
 
-	// Adjust cookie path if base prefix is not empty
 	cookiePath := "/"
 	if anubis.BasePrefix != "" {
 		cookiePath = strings.TrimSuffix(anubis.BasePrefix, "/") + "/"
+	}
+
+	if s.ipFilter != nil {
+		ip := r.Header.Get("X-Real-Ip")
+		if ip != "" {
+			parsedIP := net.ParseIP(ip)
+			if parsedIP != nil {
+				allow, reason := s.ipFilter.Check(parsedIP)
+				if !allow {
+					lg.Info("IP filter blocked request", "ip", ip, "reason", reason)
+					if s.metricsCollector != nil {
+						s.metricsCollector.RecordPoWReject("ip_filter", reason)
+					}
+					localizer := localization.GetLocalizer(r)
+					s.respondWithStatus(w, r, fmt.Sprintf("%s: %s", localizer.T("access_denied"), reason), "", s.policy.StatusCodes.Deny)
+					return
+				}
+				if reason == "whitelist" {
+					lg.Debug("IP filter whitelisted request", "ip", ip)
+					r.Header.Add("X-Anubis-Status", "PASS")
+					s.ServeHTTPNext(w, r)
+					return
+				}
+			}
+		}
 	}
 
 	cr, rule, err := s.check(r, lg)
@@ -588,6 +634,9 @@ func (s *Server) PassChallenge(w http.ResponseWriter, r *http.Request) {
 	if err := impl.Validate(r, lg, in); err != nil {
 		asn, asnDesc := asnFromContext(r.Context())
 		failedValidations.WithLabelValues(rule.Challenge.Algorithm, asn, asnDesc).Inc()
+		if s.metricsCollector != nil {
+			s.metricsCollector.RecordPoWReject(rule.Challenge.Algorithm, "validation_failed")
+		}
 		var cerr *challenge.Error
 		s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
 		lg.Debug("challenge validate call failed", "err", err)
@@ -605,6 +654,32 @@ func (s *Server) PassChallenge(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	}
+
+	if s.validationChain != nil {
+		chainResult := s.validationChain.Validate(r.Context(), r, lg)
+		if !chainResult.Passed {
+			lg.Info("validation chain failed", "failed_step", chainResult.FailedStep, "error", chainResult.Error)
+			if s.metricsCollector != nil {
+				s.metricsCollector.RecordPoWReject("validation_chain", chainResult.FailedStep)
+			}
+			s.ClearCookie(w, CookieOpts{Path: cookiePath, Host: r.Host})
+			s.respondWithStatus(w, r, fmt.Sprintf("validation failed at step: %s", chainResult.FailedStep), "", http.StatusForbidden)
+			return
+		}
+	}
+
+	if s.sessionCache != nil {
+		ip := r.Header.Get("X-Real-Ip")
+		sess := s.sessionCache.Create(ip)
+		lg.Debug("session created", "token_prefix", sess.Token[:16], "expires_at", sess.ExpiresAt)
+		if s.metricsCollector != nil {
+			s.metricsCollector.SetSessionCacheSize(s.sessionCache.Size())
+		}
+	}
+
+	if s.metricsCollector != nil {
+		s.metricsCollector.RecordPoWPass(rule.Challenge.Algorithm)
 	}
 
 	// generate JWT cookie
@@ -736,4 +811,26 @@ func (s *Server) check(r *http.Request, lg *slog.Logger) (policy.CheckResult, *p
 		},
 		Rules: &checker.List{},
 	}, nil
+}
+
+func (s *Server) Start(ctx context.Context) {
+	if s.adaptiveDifficulty != nil {
+		s.adaptiveDifficulty.Start(ctx)
+		s.logger.Info("adaptive difficulty subsystem started")
+	}
+}
+
+func (s *Server) ValidateSession(token string) (*sessioncache.Session, bool) {
+	if s.sessionCache == nil {
+		return nil, false
+	}
+	return s.sessionCache.Validate(token)
+}
+
+func (s *Server) IPFilter() *ipfilter.IPFilter {
+	return s.ipFilter
+}
+
+func (s *Server) MetricsCollector() *enhancedmetrics.Collector {
+	return s.metricsCollector
 }

@@ -324,17 +324,118 @@ func (sc StatusCodes) Valid() error {
 	return nil
 }
 
+type ValidationChainStep struct {
+	Type    string         `json:"type" yaml:"type"`
+	Config  map[string]any `json:"config,omitempty" yaml:"config,omitempty"`
+	Enabled bool           `json:"enabled" yaml:"enabled"`
+}
+
+type ValidationChainConfig struct {
+	Steps []ValidationChainStep `json:"steps" yaml:"steps"`
+}
+
+func (c ValidationChainConfig) Valid() error {
+	for i, s := range c.Steps {
+		switch s.Type {
+		case "pow", "hcaptcha", "ip_reputation":
+		default:
+			return fmt.Errorf("validation chain step %d: unknown type %q", i, s.Type)
+		}
+	}
+	return nil
+}
+
+type AdaptiveDifficultyConfig struct {
+	MinDifficulty     int           `json:"min_difficulty,omitempty" yaml:"min_difficulty,omitempty"`
+	MaxDifficulty     int           `json:"max_difficulty,omitempty" yaml:"max_difficulty,omitempty"`
+	TargetCPULoad     float64       `json:"target_cpu_load,omitempty" yaml:"target_cpu_load,omitempty"`
+	TargetConnections int           `json:"target_connections,omitempty" yaml:"target_connections,omitempty"`
+	RecalcInterval    time.Duration `json:"recalc_interval,omitempty" yaml:"recalc_interval,omitempty"`
+	Enabled           bool          `json:"enabled" yaml:"enabled"`
+}
+
+func (c AdaptiveDifficultyConfig) Valid() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.MinDifficulty < 0 || c.MinDifficulty > 100 {
+		return fmt.Errorf("adaptive difficulty: min_difficulty must be 0-100, got %d", c.MinDifficulty)
+	}
+	if c.MaxDifficulty < 1 || c.MaxDifficulty > 100 {
+		return fmt.Errorf("adaptive difficulty: max_difficulty must be 1-100, got %d", c.MaxDifficulty)
+	}
+	if c.MinDifficulty > c.MaxDifficulty {
+		return fmt.Errorf("adaptive difficulty: min_difficulty > max_difficulty")
+	}
+	return nil
+}
+
+type IPFilterEntry struct {
+	CIDR     string `json:"cidr" yaml:"cidr"`
+	ListType string `json:"list_type" yaml:"list_type"`
+}
+
+type IPFilterConfig struct {
+	Entries []IPFilterEntry `json:"entries" yaml:"entries"`
+}
+
+func (c IPFilterConfig) Valid() error {
+	for i, e := range c.Entries {
+		if e.CIDR == "" {
+			return fmt.Errorf("ip filter entry %d: empty CIDR", i)
+		}
+		switch e.ListType {
+		case "whitelist", "blacklist":
+		default:
+			return fmt.Errorf("ip filter entry %d: invalid list_type %q", i, e.ListType)
+		}
+	}
+	return nil
+}
+
+type EnhancedMetricsConfig struct {
+	MetricsToken string `json:"metrics_token,omitempty" yaml:"metrics_token,omitempty"`
+}
+
+type SessionCacheConfig struct {
+	MaxEntries int           `json:"maxEntries,omitempty" yaml:"maxEntries,omitempty"`
+	DefaultTTL time.Duration `json:"defaultTTL,omitempty" yaml:"defaultTTL,omitempty"`
+	HMACKey    string        `json:"hmacKey" yaml:"hmacKey"`
+	Enabled    bool          `json:"enabled" yaml:"enabled"`
+}
+
+func (c SessionCacheConfig) Valid() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.MaxEntries < 0 {
+		return fmt.Errorf("session cache: maxEntries must be >= 0")
+	}
+	if c.DefaultTTL < 0 {
+		return fmt.Errorf("session cache: defaultTTL must be >= 0")
+	}
+	if c.HMACKey == "" {
+		return fmt.Errorf("session cache: hmacKey is required when enabled")
+	}
+	return nil
+}
+
 type fileConfig struct {
-	OpenGraph   openGraphFileConfig `json:"openGraph"`
-	Impressum   *Impressum          `json:"impressum,omitempty"`
-	Store       *Store              `json:"store"`
-	Bots        []BotOrImport       `json:"bots"`
-	Thresholds  []Threshold         `json:"thresholds"`
-	StatusCodes StatusCodes         `json:"status_codes"`
-	DNSBL       bool                `json:"dnsbl"`
-	DNSTTL      DnsTTL              `json:"dns_ttl"`
-	Logging     *Logging            `json:"logging"`
-	Metrics     *Metrics            `json:"metrics,omitempty"`
+	OpenGraph          openGraphFileConfig    `json:"openGraph"`
+	Impressum          *Impressum             `json:"impressum,omitempty"`
+	Store              *Store                 `json:"store"`
+	Bots               []BotOrImport          `json:"bots"`
+	Thresholds         []Threshold            `json:"thresholds"`
+	StatusCodes        StatusCodes            `json:"status_codes"`
+	DNSBL              bool                   `json:"dnsbl"`
+	DNSTTL             DnsTTL                 `json:"dns_ttl"`
+	Logging            *Logging               `json:"logging"`
+	Metrics            *Metrics               `json:"metrics,omitempty"`
+	ValidationChain    *ValidationChainConfig `json:"validation_chain,omitempty" yaml:"validation_chain,omitempty"`
+	AdaptiveDifficulty *AdaptiveDifficultyConfig `json:"adaptive_difficulty,omitempty" yaml:"adaptive_difficulty,omitempty"`
+	IPFilter           *IPFilterConfig        `json:"ip_filter,omitempty" yaml:"ip_filter,omitempty"`
+	EnhancedMetrics    *EnhancedMetricsConfig `json:"enhanced_metrics,omitempty" yaml:"enhanced_metrics,omitempty"`
+	SessionCache       *SessionCacheConfig    `json:"session_cache,omitempty" yaml:"session_cache,omitempty"`
 }
 
 func (c *fileConfig) Valid() error {
@@ -382,6 +483,30 @@ func (c *fileConfig) Valid() error {
 		}
 	}
 
+	if c.ValidationChain != nil {
+		if err := c.ValidationChain.Valid(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if c.AdaptiveDifficulty != nil {
+		if err := c.AdaptiveDifficulty.Valid(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if c.IPFilter != nil {
+		if err := c.IPFilter.Valid(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if c.SessionCache != nil {
+		if err := c.SessionCache.Valid(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	if len(errs) != 0 {
 		return fmt.Errorf("config is not valid:\n%w", errors.Join(errs...))
 	}
@@ -414,17 +539,22 @@ func Load(fin io.Reader, fname string) (*Config, error) {
 	}
 
 	result := &Config{
-		DNSBL:  c.DNSBL,
-		DNSTTL: c.DNSTTL,
+		DNSBL:              c.DNSBL,
+		DNSTTL:             c.DNSTTL,
 		OpenGraph: OpenGraph{
 			Enabled:      c.OpenGraph.Enabled,
 			ConsiderHost: c.OpenGraph.ConsiderHost,
 			Override:     c.OpenGraph.Override,
 		},
-		StatusCodes: c.StatusCodes,
-		Store:       c.Store,
-		Logging:     c.Logging,
-		Metrics:     c.Metrics,
+		StatusCodes:        c.StatusCodes,
+		Store:              c.Store,
+		Logging:            c.Logging,
+		Metrics:            c.Metrics,
+		ValidationChain:    c.ValidationChain,
+		AdaptiveDifficulty: c.AdaptiveDifficulty,
+		IPFilter:           c.IPFilter,
+		EnhancedMetrics:    c.EnhancedMetrics,
+		SessionCache:       c.SessionCache,
 	}
 
 	if c.OpenGraph.TimeToLive != "" {
@@ -507,16 +637,21 @@ func (sc DnsTTL) Valid() error {
 }
 
 type Config struct {
-	Impressum   *Impressum
-	Store       *Store
-	OpenGraph   OpenGraph
-	Bots        []BotConfig
-	Thresholds  []Threshold
-	StatusCodes StatusCodes
-	Logging     *Logging
-	DNSBL       bool
-	DNSTTL      DnsTTL
-	Metrics     *Metrics
+	Impressum          *Impressum
+	Store              *Store
+	OpenGraph          OpenGraph
+	Bots               []BotConfig
+	Thresholds         []Threshold
+	StatusCodes        StatusCodes
+	Logging            *Logging
+	DNSBL              bool
+	DNSTTL             DnsTTL
+	Metrics            *Metrics
+	ValidationChain    *ValidationChainConfig
+	AdaptiveDifficulty *AdaptiveDifficultyConfig
+	IPFilter           *IPFilterConfig
+	EnhancedMetrics    *EnhancedMetricsConfig
+	SessionCache       *SessionCacheConfig
 }
 
 func (c Config) Valid() error {
