@@ -149,9 +149,10 @@ func (a *AdaptiveDifficulty) recalculate() {
 		a.lg.Error("failed to get load average", "error", err)
 		return
 	}
+	a.RecalculateWith(avg.Load1, atomic.LoadInt64(&a.connectionCount))
+}
 
-	cpuLoad := avg.Load1
-	connCount := atomic.LoadInt64(&a.connectionCount)
+func (a *AdaptiveDifficulty) RecalculateWith(cpuLoad float64, connCount int64) {
 	baseDiff := a.config.MinDifficulty
 
 	rawTarget := baseDiff +

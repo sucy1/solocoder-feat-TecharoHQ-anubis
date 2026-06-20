@@ -3,7 +3,6 @@ package adaptivedifficulty
 import (
 	"errors"
 	"log/slog"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -283,27 +282,116 @@ func TestRecalculate_StepLimit(t *testing.T) {
 		TargetCPULoad:     0.7,
 		TargetConnections: 1000,
 		RecalcInterval:    60 * time.Second,
-		MaxStep:           2,
+		MaxStep:           3,
 		SmoothingFactor:   1.0,
 	}
 	ad := New(cfg, slog.Default())
 
 	ad.mu.Lock()
+	ad.currentDifficulty = 10
+	ad.mu.Unlock()
+
+	ad.RecalculateWith(100.0, 1000000)
+
+	after := ad.CurrentDifficulty()
+	delta := after - 10
+	if delta <= 0 {
+		t.Fatalf("difficulty should have risen, old=%d new=%d", 10, after)
+	}
+	if delta > cfg.MaxStep {
+		t.Fatalf("difficulty jumped by %d, exceeding MaxStep=%d (old=10 new=%d). rawTarget would be way above so step-limit must cap.", delta, cfg.MaxStep, after)
+	}
+	t.Logf("one-shot step: %d -> %d (delta=%d, MaxStep=%d)", 10, after, delta, cfg.MaxStep)
+}
+
+func TestRecalculate_GradualConvergence(t *testing.T) {
+	cfg := Config{
+		MinDifficulty:     1,
+		MaxDifficulty:     64,
+		TargetCPULoad:     0.7,
+		TargetConnections: 1000,
+		RecalcInterval:    60 * time.Second,
+		MaxStep:           3,
+		SmoothingFactor:   1.0,
+	}
+	ad := New(cfg, slog.Default())
+	ad.mu.Lock()
 	ad.currentDifficulty = 5
 	ad.mu.Unlock()
 
-	for i := 0; i < 5000; i++ {
-		atomic.AddInt64(&ad.connectionCount, 1)
+	oldDiff := 5
+	for i := 0; i < 10; i++ {
+		ad.RecalculateWith(100.0, 1000000)
+		newDiff := ad.CurrentDifficulty()
+		delta := newDiff - oldDiff
+		if delta < 0 {
+			t.Fatalf("iteration %d: difficulty went backwards (%d -> %d) under high load", i, oldDiff, newDiff)
+		}
+		if delta > cfg.MaxStep {
+			t.Fatalf("iteration %d: step %d > MaxStep %d (old=%d new=%d)", i, delta, cfg.MaxStep, oldDiff, newDiff)
+		}
+		oldDiff = newDiff
 	}
+	if oldDiff <= 5 {
+		t.Fatalf("difficulty should have climbed significantly after 10 high-load recalculations, got %d", oldDiff)
+	}
+	t.Logf("convergence: started at 5, after 10 steps = %d", oldDiff)
+}
 
-	ad.recalculate()
+func TestRecalculate_SmoothingApplied(t *testing.T) {
+	cfg := Config{
+		MinDifficulty:     1,
+		MaxDifficulty:     100,
+		TargetCPULoad:     1.0,
+		TargetConnections: 1,
+		RecalcInterval:    60 * time.Second,
+		MaxStep:           99,
+		SmoothingFactor:   0.5,
+	}
+	ad := New(cfg, slog.Default())
+	ad.mu.Lock()
+	ad.currentDifficulty = 10
+	ad.mu.Unlock()
+
+	ad.RecalculateWith(50.0, 1)
+
 	after := ad.CurrentDifficulty()
+	baseDiff := 1
+	rawTarget := baseDiff + int(float64(baseDiff)*(50.0/1.0)) + int(float64(baseDiff)*(1.0/1.0))
+	if rawTarget > 100 {
+		rawTarget = 100
+	}
+	expectedSmoothed := int(float64(10)*(1-cfg.SmoothingFactor)+float64(rawTarget)*cfg.SmoothingFactor + 0.5)
+	if after != expectedSmoothed {
+		t.Errorf("smoothing mismatch: got %d, expected smoothed %d (rawTarget=%d, old=10, alpha=0.5)", after, expectedSmoothed, rawTarget)
+	}
+	t.Logf("smoothing: raw=%d smoothed=%d (expected=%d)", rawTarget, after, expectedSmoothed)
+}
 
-	delta := after - 5
-	if delta < 0 {
-		delta = -delta
+func TestRecalculate_DownwardStepLimit(t *testing.T) {
+	cfg := Config{
+		MinDifficulty:     1,
+		MaxDifficulty:     100,
+		TargetCPULoad:     1.0,
+		TargetConnections: 1000,
+		RecalcInterval:    60 * time.Second,
+		MaxStep:           4,
+		SmoothingFactor:   1.0,
 	}
-	if delta > cfg.MaxStep {
-		t.Errorf("difficulty jumped by %d, exceeding MaxStep %d (old=%d new=%d)", delta, cfg.MaxStep, 5, after)
+	ad := New(cfg, slog.Default())
+	ad.mu.Lock()
+	ad.currentDifficulty = 90
+	ad.mu.Unlock()
+
+	ad.RecalculateWith(0.0001, 0)
+
+	after := ad.CurrentDifficulty()
+	drop := 90 - after
+	if drop > cfg.MaxStep {
+		t.Fatalf("downward jump %d exceeds MaxStep=%d (old=90 new=%d)", drop, cfg.MaxStep, after)
 	}
+	if drop <= 0 {
+		t.Fatalf("difficulty should drop under zero load, old=90 new=%d", after)
+	}
+	t.Logf("downward step: 90 -> %d (drop=%d, MaxStep=%d)", after, drop, cfg.MaxStep)
 }

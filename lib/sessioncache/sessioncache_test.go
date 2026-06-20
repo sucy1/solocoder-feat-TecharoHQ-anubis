@@ -387,3 +387,97 @@ func TestValidate_TamperedSignature(t *testing.T) {
 		t.Error("tampered signature should not validate")
 	}
 }
+
+func TestRotate_ActuallyChangesKey(t *testing.T) {
+	cfg := Config{
+		MaxEntries:       100,
+		DefaultTTL:       time.Hour,
+		HMACKey:          "rotation-secret",
+		RotationInterval: 24 * time.Hour,
+	}
+	c, _ := New(cfg, slog.Default())
+
+	preKid, preKey := c.activeKey()
+	if preKid != 0 {
+		t.Fatalf("pre-rotation active kid should be 0, got %d", preKid)
+	}
+	if len(preKey) == 0 {
+		t.Fatal("pre-rotation active key is empty")
+	}
+
+	preSess := c.Create("10.0.0.1")
+
+	newKid := c.Rotate()
+	postKid, postKey := c.activeKey()
+	if postKid != newKid {
+		t.Errorf("post-rotation active kid=%d, but Rotate() returned %d", postKid, newKid)
+	}
+	if len(postKey) == 0 {
+		t.Fatal("post-rotation active key is empty")
+	}
+
+	same := true
+	if len(preKey) != len(postKey) {
+		same = false
+	} else {
+		for i := range preKey {
+			if preKey[i] != postKey[i] {
+				same = false
+				break
+			}
+		}
+	}
+	if same {
+		t.Fatalf("Rotate() did not change the signing key bytes (kid pre=%d post=%d)", preKid, postKid)
+	}
+	t.Logf("keys changed: kid %d -> %d", preKid, postKid)
+
+	if _, ok := c.Validate(preSess.Token); !ok {
+		t.Fatal("pre-rotation token must remain verifiable against historical key after rotation")
+	}
+
+	postSess := c.Create("10.0.0.1")
+	var preSt, postSt signedToken
+	preB, _ := hex.DecodeString(preSess.Token)
+	postB, _ := hex.DecodeString(postSess.Token)
+	json.Unmarshal(preB, &preSt)
+	json.Unmarshal(postB, &postSt)
+
+	if preSt.KeyID == postSt.KeyID {
+		t.Errorf("pre and post rotation tokens must have different kid (both kid=%d)", preSt.KeyID)
+	}
+	if preSt.Sig == postSt.Sig {
+		t.Error("pre and post rotation tokens have identical Sig despite different keys")
+	}
+	if _, ok := c.Validate(postSess.Token); !ok {
+		t.Fatal("post-rotation token must validate")
+	}
+}
+
+func TestRotate_MultipleGenerations(t *testing.T) {
+	cfg := Config{
+		MaxEntries:       100,
+		DefaultTTL:       time.Hour,
+		HMACKey:          "multi-rotate",
+		RotationInterval: time.Nanosecond,
+	}
+	c, _ := New(cfg, slog.Default())
+
+	sessions := make([]Session, 0, 4)
+	for i := 0; i < 4; i++ {
+		s := c.Create("10.0.0.1")
+		sessions = append(sessions, s)
+		c.Rotate()
+	}
+
+	if c.nextKeyID != 5 {
+		t.Errorf("after 4 rotations nextKeyID should be 5, got %d", c.nextKeyID)
+	}
+
+	for i, s := range sessions {
+		if _, ok := c.Validate(s.Token); !ok {
+			t.Errorf("session %d from rotation %d failed to validate after all rotations", i, i)
+		}
+	}
+	t.Logf("validated %d historical sessions across %d key generations", len(sessions), 4)
+}
