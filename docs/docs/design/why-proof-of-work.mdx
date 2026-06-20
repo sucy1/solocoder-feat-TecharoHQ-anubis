@@ -1,0 +1,23 @@
+---
+title: Why does Anubis use Proof-of-Work?
+---
+
+Anubis uses [proof of work](https://en.wikipedia.org/wiki/Proof_of_work) in order to validate that clients are genuine. The reason Anubis does this was inspired by [Hashcash](https://en.wikipedia.org/wiki/Hashcash), a suggestion from the early 2000's about extending the email protocol to avoid spam. The idea is that genuine people sending emails will have to do a small math problem that is expensive to compute, but easy to verify such as hashing a string with a given number of leading zeroes. This will have basically no impact on individuals sending a few emails a week, but the company churning out industrial quantities of advertising will be required to do prohibitively expensive computation. This is also how Bitcoin's consensus algorithm works.
+
+## How Anubis' proof of work scheme works
+
+A sha256 hash is a bunch of bytes like this:
+
+```text
+394d1cc82924c2368d4e34fa450c6b30d5d02f8ae4bb6310e2296593008ff89f
+```
+
+We usually write it out in hex form, but that's literally what the bytes in ram look like. In a proof of work validation system, you take some base value (the "challenge") and a constantly incrementing number (the "nonce"), so the thing you end up hashing is this:
+
+```js
+const hash = await sha256(`${challenge}${nonce}`);
+```
+
+In order to pass a challenge, the `hash` has to have the right number of leading zeros (the "difficulty"). When a client requests to pass the challenge, they include the nonce they used. The server then only has to do one sha256 operation: the one that confirms that the challenge (generated from request metadata) and the nonce (provided by the client) match the difficulty number of leading zeroes.
+
+Ultimately, this is a hack whose real purpose is to give a "good enough" placeholder solution so that more time can be spent on fingerprinting and identifying headless browsers (EG via how they do font rendering) so that the challenge proof of work page doesn't need to be presented to known legitimate users.

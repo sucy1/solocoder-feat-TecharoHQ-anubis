@@ -1,0 +1,18 @@
+resources:
+  - 1password.yaml
+  - deployment.yaml
+  - ingress.yaml
+  - onionservice.yaml
+  - poddisruptionbudget.yaml
+  - service.yaml
+
+configMapGenerator:
+  - name: anubis-cfg
+    behavior: create
+    files:
+      - ./cfg/anubis/botPolicies.yaml
+  - name: nginx-cfg
+    behavior: create
+    files:
+      - ./cfg/nginx/mime.types
+      - ./cfg/nginx/nginx.conf

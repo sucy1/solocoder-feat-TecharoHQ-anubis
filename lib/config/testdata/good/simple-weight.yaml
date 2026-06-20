@@ -1,0 +1,10 @@
+bots:
+  - name: simple-weight-adjust
+    action: WEIGH
+    user_agent_regex: Mozilla
+    weight:
+      adjust: 5
+
+metrics:
+  bind: ":9090"
+  network: "tcp"

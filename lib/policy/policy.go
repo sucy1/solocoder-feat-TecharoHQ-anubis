@@ -1,0 +1,288 @@
+package policy
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/TecharoHQ/anubis/internal"
+	"github.com/TecharoHQ/anubis/internal/dns"
+	"github.com/TecharoHQ/anubis/lib/config"
+	"github.com/TecharoHQ/anubis/lib/policy/checker"
+	"github.com/TecharoHQ/anubis/lib/store"
+	"github.com/TecharoHQ/anubis/lib/thoth"
+	"github.com/fahedouch/go-logrotate"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	_ "github.com/TecharoHQ/anubis/lib/store/all"
+)
+
+var (
+	Applications = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "anubis_policy_results",
+		Help: "The results of each policy rule",
+	}, []string{"rule", "action", "asn", "asn_description"})
+
+	ErrChallengeRuleHasWrongAlgorithm = errors.New("config.Bot.ChallengeRules: algorithm is invalid")
+	warnedAboutThresholds             = &atomic.Bool{}
+)
+
+type ParsedConfig struct {
+	Store             store.Interface
+	orig              *config.Config
+	Impressum         *config.Impressum
+	OpenGraph         config.OpenGraph
+	Bots              []Bot
+	Thresholds        []*Threshold
+	StatusCodes       config.StatusCodes
+	DefaultDifficulty int
+	DNSBL             bool
+	DnsCache          *dns.DnsCache
+	Dns               *dns.Dns
+	Logger            *slog.Logger
+	Metrics           *config.Metrics
+	ThothClient       *thoth.Client
+	LogASN            bool
+	NeedJA4H          bool
+}
+
+func newParsedConfig(orig *config.Config) *ParsedConfig {
+	return &ParsedConfig{
+		orig:        orig,
+		OpenGraph:   orig.OpenGraph,
+		StatusCodes: orig.StatusCodes,
+		Metrics:     orig.Metrics,
+	}
+}
+
+func ParseConfig(ctx context.Context, fin io.Reader, fname string, defaultDifficulty int, logLevel string, subrequestMode bool) (*ParsedConfig, error) {
+	c, err := config.Load(fin, fname)
+	if err != nil {
+		return nil, err
+	}
+
+	var validationErrs []error
+
+	tc, hasThothClient := thoth.FromContext(ctx)
+
+	result := newParsedConfig(c)
+	result.DefaultDifficulty = defaultDifficulty
+	result.LogASN = c.Logging.LogASN
+	if hasThothClient {
+		result.ThothClient = tc
+	}
+
+	if c.Logging.Level != nil {
+		logLevel = c.Logging.Level.String()
+	}
+
+	switch c.Logging.Sink {
+	case config.LogSinkStdio:
+		result.Logger = internal.InitSlog(logLevel, os.Stderr)
+	case config.LogSinkFile:
+		out := &logrotate.Logger{
+			Filename:           c.Logging.Parameters.Filename,
+			FilenameTimeFormat: time.RFC3339,
+			MaxBytes:           c.Logging.Parameters.MaxBytes,
+			MaxAge:             c.Logging.Parameters.MaxAge,
+			MaxBackups:         c.Logging.Parameters.MaxBackups,
+			LocalTime:          c.Logging.Parameters.UseLocalTime,
+			Compress:           c.Logging.Parameters.Compress,
+		}
+
+		result.Logger = internal.InitSlog(logLevel, out)
+	}
+
+	lg := result.Logger.With("at", "config-validate")
+
+	if result.LogASN && !hasThothClient {
+		lg.Warn("logging.asn is enabled but no Thoth client is configured; ASN logging and metrics will be skipped. Please read https://anubis.techaro.lol/docs/admin/thoth for more information")
+	}
+
+	stFac, ok := store.Get(c.Store.Backend)
+	switch ok {
+	case true:
+		store, err := stFac.Build(ctx, c.Store.Parameters)
+		if err != nil {
+			validationErrs = append(validationErrs, err)
+		} else {
+			result.Store = store
+		}
+	case false:
+		validationErrs = append(validationErrs, config.ErrUnknownStoreBackend)
+	}
+
+	result.DnsCache = dns.NewDNSCache(result.orig.DNSTTL.Forward, result.orig.DNSTTL.Reverse, result.Store)
+	result.Dns = dns.New(ctx, result.DnsCache)
+
+	for _, b := range c.Bots {
+		if berr := b.Valid(); berr != nil {
+			validationErrs = append(validationErrs, berr)
+			continue
+		}
+
+		parsedBot := Bot{
+			Name:   b.Name,
+			Action: b.Action,
+		}
+
+		cl := checker.List{}
+
+		if len(b.RemoteAddr) > 0 {
+			c, err := NewRemoteAddrChecker(b.RemoteAddr)
+			if err != nil {
+				validationErrs = append(validationErrs, fmt.Errorf("while processing rule %s remote addr set: %w", b.Name, err))
+			} else {
+				cl = append(cl, c)
+			}
+		}
+
+		if b.UserAgentRegex != nil {
+			c, err := NewUserAgentChecker(*b.UserAgentRegex)
+			if err != nil {
+				validationErrs = append(validationErrs, fmt.Errorf("while processing rule %s user agent regex: %w", b.Name, err))
+			} else {
+				cl = append(cl, c)
+			}
+		}
+
+		if b.PathRegex != nil {
+			c, err := NewPathChecker(*b.PathRegex, subrequestMode)
+			if err != nil {
+				validationErrs = append(validationErrs, fmt.Errorf("while processing rule %s path regex: %w", b.Name, err))
+			} else {
+				cl = append(cl, c)
+			}
+		}
+
+		if len(b.HeadersRegex) > 0 {
+			c, err := NewHeadersChecker(b.HeadersRegex)
+			if err != nil {
+				validationErrs = append(validationErrs, fmt.Errorf("while processing rule %s headers regex map: %w", b.Name, err))
+			} else {
+				cl = append(cl, c)
+			}
+		}
+
+		if b.Expression != nil {
+			c, err := NewCELChecker(b.Expression, result.Dns, subrequestMode)
+			if err != nil {
+				validationErrs = append(validationErrs, fmt.Errorf("while processing rule %s expressions: %w", b.Name, err))
+			} else {
+				cl = append(cl, c)
+			}
+		}
+
+		if b.ASNs != nil {
+			if !hasThothClient {
+				lg.Warn("You have specified a Thoth specific check but you have no Thoth client configured. Please read https://anubis.techaro.lol/docs/admin/thoth for more information", "check", "asn", "settings", b.ASNs)
+				continue
+			}
+
+			cl = append(cl, tc.ASNCheckerFor(b.ASNs.Match))
+		}
+
+		if b.GeoIP != nil {
+			if !hasThothClient {
+				lg.Warn("You have specified a Thoth specific check but you have no Thoth client configured. Please read https://anubis.techaro.lol/docs/admin/thoth for more information", "check", "geoip", "settings", b.GeoIP)
+				continue
+			}
+
+			cl = append(cl, tc.GeoIPCheckerFor(b.GeoIP.Countries))
+		}
+
+		if b.Challenge == nil {
+			parsedBot.Challenge = &config.ChallengeRules{
+				Difficulty: defaultDifficulty,
+				Algorithm:  "fast",
+			}
+		} else {
+			parsedBot.Challenge = b.Challenge
+			if parsedBot.Challenge.Algorithm == "" {
+				parsedBot.Challenge.Algorithm = config.DefaultAlgorithm
+			}
+
+			if parsedBot.Challenge.Algorithm == "slow" {
+				lg.Warn("use of deprecated algorithm \"slow\" detected, please update this to \"fast\" when possible", "name", parsedBot.Name)
+			}
+		}
+
+		if b.Weight != nil {
+			parsedBot.Weight = b.Weight
+		}
+
+		result.Impressum = c.Impressum
+
+		parsedBot.Rules = cl
+		parsedBot.hash = parsedBot.Hash()
+
+		result.Bots = append(result.Bots, parsedBot)
+	}
+
+	for _, t := range c.Thresholds {
+		if t.Challenge != nil && t.Challenge.Algorithm == "slow" {
+			lg.Warn("use of deprecated algorithm \"slow\" detected, please update this to \"fast\" when possible", "name", t.Name)
+		}
+
+		if t.Challenge != nil && t.Challenge.ReportAs != 0 {
+			lg.Warn("use of deprecated report_as setting detected, please remove this from your policy file when possible", "name", t.Name)
+		}
+
+		if t.Name == "legacy-anubis-behaviour" && t.Expression.String() == "true" {
+			if !warnedAboutThresholds.Load() {
+				lg.Warn("configuration file does not contain thresholds, see docs for details on how to upgrade", "fname", fname, "docs_url", "https://anubis.techaro.lol/docs/admin/configuration/thresholds/")
+				warnedAboutThresholds.Store(true)
+			}
+
+			t.Challenge.Difficulty = defaultDifficulty
+		}
+
+		threshold, err := ParsedThresholdFromConfig(t)
+		if err != nil {
+			validationErrs = append(validationErrs, fmt.Errorf("can't compile threshold config for %s: %w", t.Name, err))
+			continue
+		}
+
+		result.Thresholds = append(result.Thresholds, threshold)
+	}
+
+	if len(validationErrs) > 0 {
+		return nil, fmt.Errorf("errors validating policy config JSON %s: %w", fname, errors.Join(validationErrs...))
+	}
+
+	result.DNSBL = c.DNSBL
+	result.NeedJA4H = configReferencesJA4H(c.Bots)
+
+	return result, nil
+}
+
+// configReferencesJA4H reports whether any bot rule references the JA4H
+// fingerprint header, either through a headers_regex key or a CEL expression.
+// Computing the JA4H fingerprint for every request is relatively expensive, so
+// when no rule needs it the middleware that adds the header can be skipped
+// entirely. Threshold expressions can't access request headers, so only bot
+// rules are considered.
+func configReferencesJA4H(bots []config.BotConfig) bool {
+	needle := strings.ToLower(internal.JA4HHeaderName)
+
+	for _, b := range bots {
+		for key := range b.HeadersRegex {
+			if strings.EqualFold(key, internal.JA4HHeaderName) {
+				return true
+			}
+		}
+
+		if b.Expression != nil && strings.Contains(strings.ToLower(b.Expression.String()), needle) {
+			return true
+		}
+	}
+
+	return false
+}

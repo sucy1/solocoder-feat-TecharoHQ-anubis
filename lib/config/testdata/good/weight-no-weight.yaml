@@ -1,0 +1,8 @@
+bots:
+  - name: weight
+    action: WEIGH
+    user_agent_regex: Mozilla
+
+metrics:
+  bind: ":9090"
+  network: "tcp"

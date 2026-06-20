@@ -1,0 +1,10 @@
+bots:
+  - name: challenge-cloudflare
+    action: CHALLENGE
+    asns:
+      match:
+        - 13335 # Cloudflare
+
+metrics:
+  bind: ":9090"
+  network: "tcp"

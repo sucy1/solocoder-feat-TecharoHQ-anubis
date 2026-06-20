@@ -1,0 +1,7 @@
+bots:
+  - name: generic-bot-catchall
+    user_agent_regex: (?i:bot|crawler)
+    action: CHALLENGE
+    challenge:
+      difficulty: 16
+      algorithm: hunter2 # invalid algorithm

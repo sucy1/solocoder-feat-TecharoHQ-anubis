@@ -1,0 +1,34 @@
+{
+  "github.copilot.enable": {
+    "*": false,
+    "plaintext": false,
+    "markdown": false,
+    "mdx": false,
+    "json": false,
+    "scminput": false,
+    "yaml": false,
+    "go": false,
+    "zig": false,
+    "javascript": false,
+    "properties": false
+  },
+  "[markdown]": {
+    "editor.wordWrap": "wordWrapColumn",
+    "editor.wordWrapColumn": 80,
+    "editor.wordBasedSuggestions": "off"
+  },
+  "[mdx]": {
+    "editor.wordWrap": "wordWrapColumn",
+    "editor.wordWrapColumn": 80,
+    "editor.wordBasedSuggestions": "off"
+  },
+  "[nunjucks]": {
+    "editor.wordWrap": "wordWrapColumn",
+    "editor.wordWrapColumn": 80,
+    "editor.wordBasedSuggestions": "off"
+  },
+  "cSpell.enabledFileTypes": {
+    "mdx": true,
+    "md": true
+  }
+}

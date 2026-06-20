@@ -1,0 +1,53 @@
+name: Package builds (stable)
+
+on:
+  workflow_dispatch:
+  # release:
+  #   types: [published]
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  package_builds:
+    #runs-on: alrest-techarohq
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-tags: true
+          fetch-depth: 0
+
+      - name: build essential
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "24.11.0"
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "stable"
+
+      - name: install node deps
+        run: |
+          npm ci
+
+      - name: Build Packages
+        run: |
+          go tool yeet
+
+      - name: Upload released artifacts
+        env:
+          GITHUB_TOKEN: ${{ github.TOKEN }}
+          RELEASE_VERSION: ${{github.event.release.tag_name}}
+        shell: bash
+        run: |
+          RELEASE="${RELEASE_VERSION}"
+          cd var
+          for file in *; do
+            gh release upload $RELEASE $file
+          done

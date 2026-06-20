@@ -1,0 +1,133 @@
+# Importing configuration rules
+
+import Tabs from "@theme/Tabs";
+import TabItem from "@theme/TabItem";
+
+Anubis has the ability to let you import snippets of configuration into the main configuration file. This allows you to break up your config into smaller parts that get logically assembled into one big file.
+
+EG:
+
+```yaml
+bots:
+  # Pathological bots to deny
+  - # This correlates to data/bots/ai-catchall.yaml in the source tree
+    import: (data)/bots/ai-catchall.yaml
+  - import: (data)/bots/cloudflare-workers.yaml
+  # Import all the rules in the default configuration
+  - import: (data)/meta/default-config.yaml
+```
+
+Of note, a bot rule can either have inline bot configuration or import a bot config snippet. You cannot do both in a single bot rule.
+
+```yaml
+bots:
+  - import: (data)/bots/ai-catchall.yaml
+    name: generic-browser
+    user_agent_regex: >
+      Mozilla|Opera
+    action: CHALLENGE
+```
+
+This will return an error like this:
+
+```text
+config is not valid:
+config.BotOrImport: rule definition is invalid, you must set either bot rules or an import statement, not both
+```
+
+Paths can either be prefixed with `(data)` to import from the [the data folder in the Anubis source tree](https://github.com/TecharoHQ/anubis/tree/main/data) or anywhere on the filesystem. If you don't have access to the Anubis source tree, check /usr/share/docs/anubis/data or in the tarball you extracted Anubis from.
+
+## Importing the default configuration
+
+If you want to base your configuration off of the default configuration, import `(data)/meta/default-config.yaml`:
+
+```yaml
+bots:
+  - import: (data)/meta/default-config.yaml
+  # Write your rules here
+```
+
+This will keep your configuration up to date as Anubis adapts to emerging threats.
+
+## How do I exempt most modern browsers from Anubis challenges?
+
+If you want to exempt most modern browsers from Anubis challenges, import `(data)/common/acts-like-browser.yaml`:
+
+```yaml
+bots:
+  - import: (data)/meta/default-config.yaml
+  - import: (data)/common/acts-like-browser.yaml
+  # Write your rules here
+```
+
+These rules will allow traffic that "looks like" it's from a modern copy of Edge, Safari, Chrome, or Firefox. These rules used to be enabled by default, however user reports have suggested that AI scraper bots have adapted to conform to these rules to scrape without regard for the infrastructure they are attacking.
+
+Use these rules at your own risk.
+
+## Importing from imports
+
+You can also import from an imported file in case you want to import an entire folder of rules at once.
+
+```yaml
+bots:
+  - import: (data)/bots/_deny-pathological.yaml
+```
+
+This lets you import an entire ruleset at once:
+
+```yaml
+# (data)/bots/_deny-pathological.yaml
+- import: (data)/bots/cloudflare-workers.yaml
+- import: (data)/bots/headless-browsers.yaml
+- import: (data)/bots/us-ai-scraper.yaml
+```
+
+Use this with care, you can easily get yourself into a state where Anubis recursively imports things for eternity if you are not careful. The best way to use this is to make a "root import" named `_everything.yaml` or `_allow-good.yaml` so they sort to the top. Name your meta-imports after the main verb they are enforcing so that you can glance at the configuration file and understand what it's doing.
+
+## Writing snippets
+
+Snippets can be written in either JSON or YAML, with a preference for YAML. When writing a snippet, write the bot rules you want directly at the top level of the file in a list.
+
+Here is an example snippet that allows [IPv6 Unique Local Addresses](https://en.wikipedia.org/wiki/Unique_local_address) through Anubis:
+
+```yaml
+- name: ipv6-ula
+  action: ALLOW
+  remote_addresses:
+    - fc00::/7
+```
+
+## Extracting Anubis' embedded filesystem
+
+You can always extract the list of rules embedded into the Anubis binary with this command:
+
+```text
+anubis --extract-resources=static
+```
+
+This will dump the contents of Anubis' embedded data to a new folder named `static`:
+
+```text
+static
+├── apps
+│   └── gitea-rss-feeds.yaml
+├── botPolicies.json
+├── botPolicies.yaml
+├── bots
+│   ├── ai-catchall.yaml
+│   ├── cloudflare-workers.yaml
+│   ├── headless-browsers.yaml
+│   └── us-ai-scraper.yaml
+├── common
+│   ├── allow-private-addresses.yaml
+│   └── keep-internet-working.yaml
+└── crawlers
+    ├── bingbot.yaml
+    ├── duckduckbot.yaml
+    ├── googlebot.yaml
+    ├── internet-archive.yaml
+    ├── kagibot.yaml
+    ├── marginalia.yaml
+    ├── mojeekbot.yaml
+    └── qwantbot.yaml
+```

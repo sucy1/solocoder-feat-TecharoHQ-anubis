@@ -1,0 +1,564 @@
+---
+title: Policy Definitions
+---
+
+import Tabs from "@theme/Tabs";
+import TabItem from "@theme/TabItem";
+
+Out of the box, Anubis is pretty heavy-handed. It will aggressively challenge everything that might be a browser (usually indicated by having `Mozilla` in its user agent). However, some bots are smart enough to get past the challenge. Some things that look like bots may actually be fine (IE: RSS readers). Some resources need to be visible no matter what. Some resources and remotes are fine to begin with.
+
+Anubis lets you customize its configuration with a Policy File. This is a YAML document that spells out what actions Anubis should take when evaluating requests. The [default configuration](https://github.com/TecharoHQ/anubis/blob/main/data/botPolicies.yaml) explains everything, but this page contains an overview of everything you can do with it.
+
+## Bot Policies
+
+Bot policies let you customize the rules that Anubis uses to allow, deny, or challenge incoming requests. Currently you can set policies by the following matches:
+
+- Request path
+- User agent string
+- HTTP request header values
+- [Importing other configuration snippets](./configuration/import.mdx)
+
+As of version v1.17.0 or later, configuration can be written in either JSON or YAML.
+
+Here's an example rule that denies [Amazonbot](https://developer.amazon.com/en/amazonbot):
+
+```yaml
+- name: amazonbot
+  user_agent_regex: Amazonbot
+  action: DENY
+```
+
+When this rule is evaluated, Anubis will check the `User-Agent` string of the request. If it contains `Amazonbot`, Anubis will send an error page to the user saying that access is denied, but in such a way that makes scrapers think they have correctly loaded the webpage.
+
+Right now the only kinds of policies you can write are bot policies. Other forms of policies will be added in the future.
+
+Here is a minimal policy file that will protect against most scraper bots:
+
+```yaml
+bots:
+  - name: cloudflare-workers
+    headers_regex:
+      CF-Worker: .*
+    action: DENY
+  - name: well-known
+    path_regex: ^/.well-known/.*$
+    action: ALLOW
+  - name: favicon
+    path_regex: ^/favicon.ico$
+    action: ALLOW
+  - name: robots-txt
+    path_regex: ^/robots.txt$
+    action: ALLOW
+  - name: generic-browser
+    user_agent_regex: Mozilla
+    action: CHALLENGE
+```
+
+This allows requests to [`/.well-known`](https://en.wikipedia.org/wiki/Well-known_URI), `/favicon.ico`, `/robots.txt`, and challenges any request that has the word `Mozilla` in its User-Agent string. The [default policy file](https://github.com/TecharoHQ/anubis/blob/main/data/botPolicies.yaml) is a bit more cohesive, but this should be more than enough for most users.
+
+If no rules match the request, it is allowed through. For more details on this default behavior and its implications, see [Default allow behavior](./default-allow-behavior.mdx).
+
+### Writing your own rules
+
+There are four actions that can be returned from a rule:
+
+| Action      | Effects                                                                                                                             |
+| :---------- | :---------------------------------------------------------------------------------------------------------------------------------- |
+| `ALLOW`     | Bypass all further checks and send the request to the backend.                                                                      |
+| `DENY`      | Deny the request and send back an error message that scrapers think is a success.                                                   |
+| `CHALLENGE` | Show a challenge page and/or validate that clients have passed a challenge.                                                         |
+| `WEIGH`     | Change the [request weight](#request-weight) for this request. See the [request weight](#request-weight) docs for more information. |
+
+Name your rules in lower case using kebab-case. Rule names will be exposed in Prometheus metrics.
+
+### Challenge configuration
+
+Rules can also have their own challenge settings. These are customized using the `"challenge"` key. For example, here is a rule that makes challenges artificially hard for connections with the substring "bot" in their user agent:
+
+This rule has been known to have a high false positive rate in testing. Please use this with care.
+
+```yaml
+# Punish any bot with "bot" in the user-agent string
+- name: generic-bot-catchall
+  user_agent_regex: (?i:bot|crawler)
+  action: CHALLENGE
+  challenge:
+    difficulty: 16 # impossible
+    algorithm: slow # intentionally waste CPU cycles and time
+```
+
+Challenges can be configured with these settings:
+
+| Key          | Example  | Description                                                                                                                                                      |
+| :----------- | :------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `difficulty` | `4`      | The challenge difficulty (number of leading zeros) for proof-of-work. See [Why does Anubis use Proof-of-Work?](/docs/design/why-proof-of-work) for more details. |
+| `algorithm`  | `"fast"` | The challenge method to use. See [the list of challenge methods](./configuration/challenges/) for more information.                                              |
+
+### Remote IP based filtering
+
+The `remote_addresses` field of a Bot rule allows you to set the IP range that this ruleset applies to.
+
+For example, you can allow a search engine to connect if and only if its IP address matches the ones they published:
+
+```yaml
+- name: qwantbot
+  user_agent_regex: \+https\://help\.qwant\.com/bot/
+  action: ALLOW
+  # https://help.qwant.com/wp-content/uploads/sites/2/2025/01/qwantbot.json
+  remote_addresses: ["91.242.162.0/24"]
+```
+
+This also works at an IP range level without any other checks:
+
+```yaml
+name: internal-network
+action: ALLOW
+remote_addresses:
+  - 100.64.0.0/10
+```
+
+## Metrics server
+
+Anubis includes support for [Prometheus-style metrics](https://prometheus.io/docs/introduction/overview/), allowing systems administrators to monitor Anubis' performance and effectiveness. This is a separate HTTP server with metrics, health checking, and debug routes.
+
+Anubis' metrics server is configured with the `metrics` block in the configuration file:
+
+```yaml
+metrics:
+  bind: ":9090"
+  network: "tcp"
+```
+
+If you want to bind metrics to a Unix socket, make sure to set the network to `unix` and add a socket mode:
+
+```yaml
+metrics:
+  bind: "/tmp/anubis_metrics.sock"
+  network: unix
+  socketMode: "0700" # must be a string
+```
+
+### Debug routes
+
+Anubis' metrics server supports [pprof](https://pkg.go.dev/runtime/pprof), the Go standard library tool for profiling Go applications. This is very useful for debugging how Anubis works in the wild with regards to CPU, multicore, and RAM usage. pprof is very powerful and can expose command line arguments as part of the debugging setup (inside Google, everything is done with command line flags).
+
+Prior versions of Anubis exposed pprof endpoints on all TCP bindhosts by default. This means that machines with incorrectly configured firewalls can expose command line arguments to the public internet in the right conditions.
+
+In order to enable pprof profiling endpoints on the Metrics server, set the `debug` flag under the `metrics` block:
+
+```yaml
+metrics:
+  bind: ":9090"
+  network: "tcp"
+
+  debug: true
+```
+
+To err on the side of caution, this defaults to disabled. If this defaults migration breaks your configuration, please let us know in a ticket.
+
+### TLS
+
+If you want to serve the metrics server over TLS, use the `tls` block:
+
+```yaml
+metrics:
+  bind: ":9090"
+  network: "tcp"
+
+  tls:
+    certificate: /path/to/tls.crt
+    key: /path/to/tls.key
+```
+
+The certificate and key will automatically be reloaded when the respective files change.
+
+### mTLS
+
+If you want to validate requests to ensure that they use a client certificate signed by a certificate authority (mutual TLS or mTLS), set the `ca` value in the `tls` block:
+
+```yaml
+metrics:
+  bind: ":9090"
+  network: "tcp"
+
+  tls:
+    certificate: /path/to/tls.crt
+    key: /path/to/tls.key
+    ca: /path/to/ca.crt
+```
+
+As it is not expected for certificate authority certificates to change often, the CA certificate will NOT be automatically reloaded when the respective file changes.
+
+### HTTP basic authentication
+
+Anubis' metrics server also supports setting HTTP basic auth as a lightweight protection against unauthorized users viewing metrics data. As the basic auth credentials are hardcoded in the configuration file, administrators SHOULD use randomly generated credentials, such as type-4 UUIDs or other high entropy strings. These credentials MUST NOT be sensitive or used to protect other high value systems.
+
+Configure it with the `basicAuth` block under `metrics`:
+
+```yaml
+metrics:
+  bind: ":9090"
+  network: "tcp"
+
+  basicAuth:
+    username: azurediamond
+    password: hunter2
+```
+
+If you have Python installed, you can generate a high entropy password with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`.
+
+## Imprint / Impressum support
+
+Anubis has support for showing imprint / impressum information. This is defined in the `impressum` block of your configuration. See [Imprint / Impressum configuration](./configuration/impressum.mdx) for more information.
+
+## Storage backends
+
+Anubis needs to store temporary data in order to determine if a user is legitimate or not. Administrators should choose a storage backend based on their infrastructure needs. Each backend has its own advantages and disadvantages.
+
+Anubis offers the following storage backends:
+
+- [`memory`](#memory) -- A simple in-memory hashmap
+- [`bbolt`](#bbolt) -- An on-disk key/value store backed by [bbolt](https://github.com/etcd-io/bbolt), an embedded key/value database for Go programs
+- [`valkey`](#valkey) -- A remote in-memory key/value database backed by [Valkey](https://valkey.io/) (or another database compatible with the [RESP](https://redis.io/docs/latest/develop/reference/protocol-spec/) protocol)
+
+If no storage backend is set in the policy file, Anubis will use the [`memory`](#memory) backend by default. This is equivalent to the following in the policy file:
+
+```yaml
+store:
+  backend: memory
+  parameters: {}
+```
+
+### `memory`
+
+The memory backend is an in-memory cache. This backend works best if you don't use multiple instances of Anubis or don't have mutable storage in the environment you're running Anubis in.
+
+| Should I use this backend?                                    | Yes/no |
+| :------------------------------------------------------------ | :----- |
+| Are you running only one instance of Anubis for this service? | ✅ Yes |
+| Does your service get a lot of traffic?                       | 🚫 No  |
+| Do you want to store data persistently when Anubis restarts?  | 🚫 No  |
+| Do you run Anubis without mutable filesystem storage?         | ✅ Yes |
+
+The biggest downside is that there is not currently a limit to how much data can be stored in memory. This will be addressed at a later time.
+
+:::warning
+
+The in-memory backend exists mostly for validation, testing, and to ensure that the default configuration of Anubis works as expected. Do not use this persistently in production.
+
+:::
+
+#### Configuration
+
+The memory backend does not require any configuration to use.
+
+### `bbolt`
+
+An on-disk storage layer powered by [bbolt](https://github.com/etcd-io/bbolt), a high performance embedded key/value database used by containerd, etcd, Kubernetes, and NATS. This backend works best if you're running Anubis on a single host and get a lot of traffic.
+
+| Should I use this backend?                                    | Yes/no |
+| :------------------------------------------------------------ | :----- |
+| Are you running only one instance of Anubis for this service? | ✅ Yes |
+| Does your service get a lot of traffic?                       | ✅ Yes |
+| Do you want to store data persistently when Anubis restarts?  | ✅ Yes |
+| Do you run Anubis without mutable filesystem storage?         | 🚫 No  |
+
+When Anubis opens a bbolt database, it takes an exclusive lock on that database. Other instances of Anubis or other tools cannot view the bbolt database while it is locked by another instance of Anubis. If you run multiple instances of Anubis for different services, give each its own `bbolt` configuration.
+
+#### Configuration
+
+The `bbolt` backend takes the following configuration options:
+
+| Name   | Type | Example            | Description                                                                                                                  |
+| :----- | :--- | :----------------- | :--------------------------------------------------------------------------------------------------------------------------- |
+| `path` | path | `/data/anubis.bdb` | The filesystem path for the Anubis bbolt database. Anubis requires write access to the folder containing the bbolt database. |
+
+Example:
+
+If you have persistent storage mounted to `/data`, then your store configuration could look like this:
+
+```yaml
+store:
+  backend: bbolt
+  parameters:
+    path: /data/anubis.bdb
+```
+
+### `s3api`
+
+A network-backed storage layer backed by [object storage](https://en.wikipedia.org/wiki/Object_storage), specifically using the [S3 API](https://docs.aws.amazon.com/AmazonS3/latest/API/Type_API_Reference.html). This can be backed by any S3-compatible object storage service such as:
+
+- [AWS S3](https://aws.amazon.com/s3/)
+- [Cloudflare R2](https://www.cloudflare.com/developer-platform/products/r2/)
+- [Hetzner Object Storage](https://www.hetzner.com/storage/object-storage/)
+- [Minio](https://www.min.io/)
+- [Tigris](https://www.tigrisdata.com/)
+
+If you are using a cloud platform, they likely provide an S3 compatible object storage service. If not, you may want to choose [one of the fastest options](https://www.tigrisdata.com/blog/benchmark-small-objects/).
+
+| Should I use this backend?                                    | Yes/no |
+| :------------------------------------------------------------ | :----- |
+| Are you running only one instance of Anubis for this service? | 🚫 No  |
+| Does your service get a lot of traffic?                       | ✅ Yes |
+| Do you want to store data persistently when Anubis restarts?  | ✅ Yes |
+| Do you run Anubis without mutable filesystem storage?         | ✅ Yes |
+
+:::note
+
+Using this backend will cause a lot of S3 operations, at least one for creating challenges, one for invalidating challenges, one for updating challenges to prevent double-spends, and one for removing challenges.
+
+:::
+
+#### Configuration
+
+The `s3api` backend takes the following configuration options:
+
+| Name         | Type    | Example       | Description                                                                                                                                 |
+| :----------- | :------ | :------------ | :------------------------------------------------------------------------------------------------------------------------------------------ |
+| `bucketName` | string  | `anubis-data` | (Required) The name of the dedicated bucket for Anubis to store information in.                                                             |
+| `pathStyle`  | boolean | `false`       | If true, use path-style S3 API operations. Please consult your storage provider's documentation if you don't know what you should put here. |
+
+:::note
+
+You should probably enable a lifecycle expiration rule for buckets containing Anubis data. Here is an example policy:
+
+```json
+{
+  "Rules": [
+    {
+      "Status": "Enabled",
+      "Expiration": {
+        "Days": 7
+      }
+    }
+  ]
+}
+```
+
+Adjust this as facts and circumstances demand, but 7 days should be enough for anyone.
+
+:::
+
+Example:
+
+Assuming your environment looks like this:
+
+```sh
+# All of the following are fake credentials that look like real ones.
+AWS_ACCESS_KEY_ID=accordingToAllKnownRulesOfAviation
+AWS_SECRET_ACCESS_KEY=thereIsNoWayABeeShouldBeAbleToFly
+AWS_REGION=yow
+AWS_ENDPOINT_URL_S3=https://yow.s3.probably-not-malware.lol
+```
+
+Then your configuration would look like this:
+
+```yaml
+store:
+  backend: s3api
+  parameters:
+    bucketName: techaro-prod-anubis
+    pathStyle: false
+```
+
+### `valkey`
+
+[Valkey](https://valkey.io/) is an in-memory key/value store that clients access over the network. This allows multiple instances of Anubis to share information and does not require each instance of Anubis to have persistent filesystem storage.
+
+:::note
+
+You can also use [Redis™](http://redis.io/) with Anubis.
+
+:::
+
+This backend is ideal if you are running multiple instances of Anubis in a worker pool (eg: Kubernetes Deployments with a copy of Anubis in each Pod).
+
+| Should I use this backend?                                    | Yes/no |
+| :------------------------------------------------------------ | :----- |
+| Are you running only one instance of Anubis for this service? | 🚫 No  |
+| Does your service get a lot of traffic?                       | ✅ Yes |
+| Do you want to store data persistently when Anubis restarts?  | ✅ Yes |
+| Do you run Anubis without mutable filesystem storage?         | ✅ Yes |
+| Do you have Redis™ or Valkey installed?                       | ✅ Yes |
+
+#### Configuration
+
+The `valkey` backend takes the following configuration options:
+
+| Name       | Type   | Example                 | Description                                                                                                                                       |
+| :--------- | :----- | :---------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cluster`  | bool   | `false`                 | If true, use [Redis™ Clustering](https://redis.io/topics/cluster-spec) for storing Anubis data.                                                   |
+| `sentinel` | object | `{}`                    | See [Redis™ Sentinel docs](#redis-sentinel) for more detail and examples                                                                          |
+| `url`      | string | `redis://valkey:6379/0` | The URL for the instance of Redis™ or Valkey that Anubis should store data in. This is in the same format as `REDIS_URL` in many cloud providers. |
+
+Example:
+
+If you have an instance of Valkey running with the hostname `valkey.int.techaro.lol`, then your store configuration could look like this:
+
+```yaml
+store:
+  backend: valkey
+  parameters:
+    url: "redis://valkey.int.techaro.lol:6379/0"
+```
+
+This would have the Valkey client connect to host `valkey.int.techaro.lol` on port `6379` with database `0` (the default database).
+
+#### Redis™ Sentinel
+
+If you are using [Redis™ Sentinel](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/) for a high availability setup, you need to configure the `sentinel` object. This object takes the following configuration options:
+
+| Name         | Type                     | Example               | Description                                                                                                                                               |
+| :----------- | :----------------------- | :-------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `addr`       | string or list of string | `10.43.208.130:26379` | (Required) The host and port of the Redis™ Sentinel server. When possible, use DNS names for this. If you have multiple addresses, supply a list of them. |
+| `clientName` | string                   | `Anubis`              | The client name reported to Redis™ Sentinel. Set this if you want to track Anubis connections to your Redis™ Sentinel.                                    |
+| `masterName` | string                   | `mymaster`            | (Required) The name of the master in the Redis™ Sentinel configuration. This is used to discover where to find client connection hosts/ports.             |
+| `username`   | string                   | `azurediamond`        | The username used to authenticate against the Redis™ Sentinel and Redis™ servers.                                                                         |
+| `password`   | string                   | `hunter2`             | The password used to authenticate against the Redis™ Sentinel and Redis™ servers.                                                                         |
+
+## Logging management
+
+Anubis has very verbose logging out of the box. This is intentional and allows administrators to be sure that it is working merely by watching it work in real time. Some administrators may not appreciate this level of logging out of the box. As such, Anubis lets you customize details about how it logs data.
+
+Anubis uses a practice called [structured logging](https://stackify.com/what-is-structured-logging-and-why-developers-need-it/) to emit log messages with key-value pair context. In order to make analyzing large amounts of log messages easier, Anubis encodes all logs in JSON. This allows you to use any tool that can parse JSON to perform analytics or monitor for issues.
+
+Anubis exposes the following logging settings in the policy file:
+
+| Name         | Type                     | Example         | Description                                                                                                                              |
+| :----------- | :----------------------- | :-------------- | :--------------------------------------------------------------------------------------------------------------------------------------- |
+| `level`      | [log level](#log-levels) | `info`          | The logging level threshold. Any logs that are at or above this threshold will be drained to the sink. Any other logs will be discarded. |
+| `sink`       | string                   | `stdio`, `file` | The sink where the logs drain to as they are being recorded in Anubis.                                                                   |
+| `parameters` | object                   |                 | Parameters for the given logging sink. This will vary based on the logging sink of choice. See below for more information.               |
+| `asn`        | bool                     | `true`, `false` | Add ASN information to logs/metrics. (Requires a Thoth client configured)                                                                |
+
+Anubis supports the following logging sinks:
+
+1. `file`: logs are emitted to a file that is rotated based on size and age. Old log files are compressed with gzip to save space. This allows for better integration with users that decide to use legacy service managers (OpenRC, FreeBSD's init, etc).
+2. `stdio`: logs are emitted to the standard error stream of the Anubis process. This allows runtimes such as Docker, Podman, Systemd, and Kubernetes to capture logs with their native logging subsystems without any additional configuration.
+
+### Log levels
+
+Anubis uses Go's [standard library `log/slog` package](https://pkg.go.dev/log/slog) to emit structured logs. By default, Anubis logs at the [Info level](https://pkg.go.dev/log/slog#Level), which is fairly verbose out of the box. Here are the possible logging levels in Anubis:
+
+| Log level | Use in Anubis                                                                                                                                             |
+| :-------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DEBUG`   | The raw unfiltered torrent of doom. Only use this if you are actively working on Anubis or have very good reasons to use it.                              |
+| `INFO`    | The default logging level, fairly verbose in order to make it easier for automation to parse.                                                             |
+| `WARN`    | A "more silent" logging level. Much less verbose. Some things that are now at the `info` level need to be moved up to the `warn` level in future patches. |
+| `ERROR`   | Only log error messages.                                                                                                                                  |
+
+Additionally, you can set a "slightly higher" log level if you need to, such as:
+
+```yaml
+logging:
+  sink: stdio
+  level: "INFO+1"
+```
+
+This isn't currently used by Anubis, but will be in the future for "slightly important" information.
+
+### `file` sink
+
+The `file` sink makes Anubis write its logs to the filesystem and rotate them out when the log file meets certain thresholds. This logging sink takes the following parameters:
+
+| Name           | Type            | Example               | Description                                                                                                                                                                                                                    |
+| :------------- | :-------------- | :-------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `file`         | string          | `/var/log/anubis.log` | The file where Anubis logs should be written to. Make sure the user Anubis is running as has write and file creation permissions to this directory.                                                                            |
+| `maxBackups`   | number          | `3`                   | The number of old log files that should be maintained when log files are rotated out.                                                                                                                                          |
+| `maxBytes`     | number of bytes | `67108864` (64Mi)     | The maximum size of each log file before it is rotated out.                                                                                                                                                                    |
+| `maxAge`       | number of days  | `7`                   | If a log file is more than this many days old, rotate it out.                                                                                                                                                                  |
+| `compress`     | boolean         | `true`                | If true, compress old log files with gzip. This should be set to `true` and is only exposed as an option for dealing with legacy workflows where there is magical thinking about log files at play.                            |
+| `useLocalTime` | boolean         | `false`               | If true, use the system local time zone to create log filenames instead of UTC. This should almost always be set to `false` and is only exposed for legacy workflows where there is magical thinking about time zones at play. |
+
+```yaml
+logging:
+  sink: file
+  parameters:
+    file: "./var/anubis.log"
+    maxBackups: 3 # keep at least 3 old copies
+    maxBytes: 67108864 # each file can have up to 64 Mi of logs
+    maxAge: 7 # rotate files out every n days
+    compress: true # gzip-compress old log files
+    useLocalTime: false # timezone for rotated files is UTC
+```
+
+When files are rotated out, the old files will be named after the rotation timestamp in [RFC 3339 format](https://www.rfc-editor.org/rfc/rfc3339).
+
+:::note
+
+If you are running Anubis in systemd via a native package, the default systemd unit settings are very restrictive and will forbid writing to folders in `/var/log`. In order to fix this, please make a [drop-in unit](https://www.flatcar.org/docs/latest/setup/systemd/drop-in-units/) like the following:
+
+```text
+# /etc/systemd/anubis@instance-name.service.d/50-var-log-readwrite.conf
+[Service]
+ReadWritePaths=/run /var/log/anubis
+```
+
+Once you write this to the correct place, reload the systemd configuration:
+
+```text
+sudo systemctl daemon-reload
+```
+
+And then restart Anubis:
+
+```text
+sudo systemctl restart anubis@instance-name
+```
+
+You may be required to make drop-ins for each Anubis instance depending on the facts and circumstances of your deployment.
+
+:::
+
+### `stdio` sink
+
+By default, Anubis logs everything to the standard error stream of its process. This requires no configuration:
+
+```yaml
+logging:
+  sink: stdio
+```
+
+If you use a service orchestration platform that does not capture the standard error stream of processes, you need to use a different logging sink.
+
+## Risk calculation for downstream services
+
+In case your service needs it for risk calculation reasons, Anubis exposes information about the rules that any requests match using a few headers:
+
+| Header            | Explanation                                          | Example          |
+| :---------------- | :--------------------------------------------------- | :--------------- |
+| `X-Anubis-Rule`   | The name of the rule that was matched                | `bot/lightpanda` |
+| `X-Anubis-Action` | The action that Anubis took in response to that rule | `CHALLENGE`      |
+| `X-Anubis-Status` | The status and how strict Anubis was in its checks   | `PASS`           |
+
+Policy rules are matched using [Go's standard library regular expressions package](https://pkg.go.dev/regexp). You can mess around with the syntax at [regex101.com](https://regex101.com), make sure to select the Golang option.
+
+## Request Weight
+
+Anubis rules can also add or remove "weight" from requests, allowing administrators to configure custom levels of suspicion. For example, if your application uses session tokens named `i_love_gitea`:
+
+```yaml
+- name: gitea-session-token
+  action: WEIGH
+  expression:
+    all:
+      - '"Cookie" in headers'
+      - headers["Cookie"].contains("i_love_gitea=")
+  # Remove 5 weight points
+  weight:
+    adjust: -5
+```
+
+This would remove five weight points from the request, which would make Anubis present the [Meta Refresh challenge](./configuration/challenges/metarefresh.mdx) in the default configuration.
+
+### Weight Thresholds
+
+For more information on configuring weight thresholds, see [Weight Threshold Configuration](./configuration/thresholds.mdx)
+
+### Advice
+
+Weight is still very new and needs work. This is an experimental feature and should be treated as such. Here's some advice to help you better tune requests:
+
+- The default weight for browser-like clients is 10. This triggers an aggressive challenge.
+- Remove and add weight in multiples of five.
+- Be careful with how you configure weight.

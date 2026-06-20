@@ -1,0 +1,11 @@
+bots:
+  - name: simple
+    action: CHALLENGE
+    user_agent_regex: Mozilla
+
+logging:
+  sink: "stdio"
+
+metrics:
+  bind: ":9090"
+  network: "tcp"
